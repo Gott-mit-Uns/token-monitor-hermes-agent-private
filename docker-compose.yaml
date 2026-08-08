@@ -1,0 +1,45 @@
+services:
+  token-monitor-hermes-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/gott-mit-uns/token-monitor-hermes-agent:0.42.0-nas.2
+    container_name: token-monitor-hermes-agent
+    restart: unless-stopped
+    init: true
+    user: "65532:10000"
+    env_file:
+      - .env
+    environment:
+      HERMES_HOME: /hermes
+      HOME: /config
+      XDG_CONFIG_HOME: /config
+      TOKEN_MONITOR_DEVICE_ID: Hermes-NAS
+      TOKEN_MONITOR_CLIENTS: hermes
+      TOKEN_MONITOR_PROJECTS_ENABLED: "0"
+      TOKEN_MONITOR_LIMITS_ENABLED: "0"
+      TOKEN_MONITOR_WATCH_DEBOUNCE_MS: "30000"
+    mem_limit: 512m
+    cpus: 1.00
+    pids_limit: 64
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    volumes:
+      - /volume1/docker/hermes:/hermes:ro
+      - /volume1/docker/token-monitor-hermes-agent/state:/config
+    healthcheck:
+      test: ["CMD-SHELL", "test -s '/config/Token Monitor/agent.pid' && kill -0 \"$(cat '/config/Token Monitor/agent.pid')\" && node -e \"const s=require('node:fs').statSync('/config/Token Monitor/last-success'); process.exit(Date.now()-s.mtimeMs <= 900000 ? 0 : 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5m
