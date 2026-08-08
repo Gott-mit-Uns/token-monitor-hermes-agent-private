@@ -15,5 +15,8 @@ backups/
 *.tgz
 app/src/electron/
 app/src/hub/
+app/AGENTS.md
+app/tests/docs/
 app/tests/electron/
 app/tests/hub/
+app/tests/worker/
