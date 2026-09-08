@@ -8,10 +8,16 @@ Target: DXP4800, existing device ID `Hermes-NAS-4800`.
 - Old running container baseline: approximately 147 MiB of 512 MiB, 0 restarts.
 - Repository visibility verified private; collaborator list contained only the owner.
 
-Deployment is pending: the NAS SSH service became unavailable after tests and before
-backup/dry-run/deployment. The existing v0.42.1 container has not been replaced.
-Actual-data dry-run, state backup, post-deployment Hub receipt, and new-runtime
-memory measurements must pass before this upgrade is reported as deployed.
+Deployment completed on 2026-09-08 after the SSH session was restored.
+- Consistent state and original configuration/source backup completed before cutover.
+- A dry run against the Hermes database, using an independent state copy, succeeded.
+- Today, month and all-time token totals matched the old Agent's Hub record exactly.
+- The existing Compose path and device ID were retained.
+- Hub received version 0.54.0 with Hermes active after cutover.
+- Local collection and upload checks both reported ok; Docker health was healthy.
+- Restart count was zero. Post-start memory snapshot: 118.4 MiB of 512 MiB, CPU 0%.
+  This is a snapshot, not a long-term performance benchmark.
+- Old image, original files and state snapshots remain on the NAS for rollback.
 
 The new health command distinguishes successful collection from successful upload.
 Upload staleness is reported separately; it does not trigger restart loops while
