@@ -22,3 +22,19 @@ Deployment completed on 2026-09-08 after the SSH session was restored.
 The new health command distinguishes successful collection from successful upload.
 Upload staleness is reported separately; it does not trigger restart loops while
 the Hub is offline. No automatic device deletion is enabled.
+
+## DH4300plus deployment
+
+- Built the same release natively on aarch64; all 19 Agent tests passed.
+- Backed up the original configuration, source, state and cutover state under
+  `/volume4/docker/token-monitor-backup-20260908`; retained the old image.
+- A dry run with an independent state copy matched the old Hub record's today,
+  month and all-time token totals exactly.
+- Retained `Hermes-NAS-4300`, the NAS-local `.env`, and the original
+  `/volume4/docker/token-monitor-hermes-agent/docker-compose.yaml` path.
+- Hub received Agent version 0.54.0 with Hermes active after deployment.
+- Collection and upload both reported ok; Docker health was healthy with zero restarts.
+- Memory snapshots: 70.54 MiB before, 51.34 MiB after, out of 512 MiB; CPU 0%.
+  These are point-in-time observations, not a long-term performance benchmark.
+- The repository's `docker-compose.4300.yaml` is the volume4 deployment template;
+  install it as `docker-compose.yaml` on the NAS to preserve UGREEN project management.

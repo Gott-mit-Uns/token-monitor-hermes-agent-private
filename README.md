@@ -24,6 +24,16 @@ docker compose up -d token-monitor-hermes-agent
 
 Changing `TOKEN_MONITOR_DEVICE_ID` requires Compose recreation; `docker restart` and `docker compose restart` do not reload changed environment values.
 
+### DH4300plus (ARM64)
+
+Use `docker-compose.4300.yaml` as the deployment template. It uses the device ID
+`Hermes-NAS-4300` and `/volume4/docker` host paths. On the NAS, install this
+template as `/volume4/docker/token-monitor-hermes-agent/docker-compose.yaml`
+so the existing UGREEN project keeps its original file path. Keep the existing
+local `.env` and `state` directory. Build on the ARM64 NAS; do not import an x86
+image from the DXP4800. The pinned multi-platform Node image and npm platform
+dependencies select the architecture at build time.
+
 ## Image
 
 ```text

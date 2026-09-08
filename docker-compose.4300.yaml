@@ -1,0 +1,58 @@
+services:
+  token-monitor-hermes-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: token-monitor-hermes-agent:0.54.0-nas.1
+    container_name: token-monitor-hermes-agent
+    restart: unless-stopped
+    init: true
+    # The NAS ACL protects the Hermes directory. Run as its owner, with only
+    # DAC_READ_SEARCH restored so the agent can read and watch this read-only bind.
+    user: "0:0"
+    env_file:
+      - .env
+    environment:
+      HERMES_HOME: /hermes
+      HOME: /config
+      XDG_CONFIG_HOME: /config
+      TOKEN_MONITOR_DEVICE_ID: Hermes-NAS-4300
+      TOKEN_MONITOR_CLIENTS: hermes
+      TOKEN_MONITOR_INTERVAL_MS: "300000"
+      TOKEN_MONITOR_PROJECTS_ENABLED: "0"
+      TOKEN_MONITOR_LIMITS_ENABLED: "0"
+      TOKEN_MONITOR_HISTORY_ENABLED: "1"
+      TOKEN_MONITOR_SESSION_USAGE_ARCHIVE_ENABLED: "1"
+      # Native events speed up updates; the 5-minute collector interval remains
+      # as a fallback when no filesystem event arrives.
+      TOKEN_MONITOR_WATCH: "1"
+      TOKEN_MONITOR_WATCH_DEBOUNCE_MS: "30000"
+    mem_limit: 512m
+    cpus: 0.50
+    pids_limit: 64
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_READ_SEARCH
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    volumes:
+      - /volume4/docker/hermes:/hermes:ro
+      - /volume4/docker/token-monitor-hermes-agent/state:/config
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          node src/agent/nasHealth.js
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5m
