@@ -1,12 +1,14 @@
-FROM node@sha256:0557ac14e0d45d02ed563067b82856ca5e7aa3437fa28d98d4350ea9c3d9494a AS dependencies
+FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS dependencies
 
 WORKDIR /opt/token-monitor
 COPY app/package.json app/package-lock.json ./
-RUN npm ci --omit=dev && npm cache clean --force
+COPY app/scripts ./scripts
+RUN npm ci --omit=dev && npm run ensure:tokscale && npm cache clean --force
+RUN npm pkg delete dependencies.electron-updater 'dependencies.@xhayper/discord-rpc' && npm prune --omit=dev
 
-FROM node:22-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436
+FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
 
-ARG BUILD_VERSION=0.42.0-nas.2
+ARG BUILD_VERSION=0.54.0-nas.1
 ARG VCS_REF=unknown
 ENV NODE_ENV=production
 WORKDIR /opt/token-monitor

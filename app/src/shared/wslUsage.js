@@ -2,7 +2,9 @@
 
 const fs = require('node:fs');
 const { execFileSync } = require('node:child_process');
+const { throwIfAborted } = require('./abortSignal');
 const { emptyPeriod, extractUsageFromTokscale, mergePeriods } = require('./usage');
+const { REASONIX_CLIENT } = require('./reasonixPaths');
 const { buildPromaPeriods, collectPromaRows } = require('./promaUsage');
 
 const LXSS_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss';
@@ -36,15 +38,20 @@ const WSL_DATA_MARKERS = [
   '.local/share/zed/threads/threads.db',
   '.config/Code/User/globalStorage/kilocode.kilo-code/tasks',
   '.vscode-server/data/User/globalStorage/kilocode.kilo-code/tasks',
+  '.commandcode/projects',
+  '.dsh/sessions',
   '.local/share/mimocode/mimocode.db',
   '.zcode/projects',
+  '.zcode/cli/db',
   '.kiro/sessions',
   '.local/share/kiro-cli/data.sqlite3',
   '.config/Kiro/User/globalStorage/kiro.kiroagent',
   '.config/kiro/User/globalStorage/kiro.kiroagent',
   '.codebuddy/projects',
   '.workbuddy',
-  '.proma/agent-sessions'
+  '.proma/agent-sessions',
+  '.lmstudio/server-logs',
+  '.unsloth/studio/studio.db'
 ];
 
 // Maps every WSL_DATA_MARKERS entry to the tracked-client id that owns it, so a
@@ -76,15 +83,20 @@ const MARKER_CLIENTS = {
   '.local/share/zed/threads/threads.db': 'zed',
   '.config/Code/User/globalStorage/kilocode.kilo-code/tasks': 'kilocode',
   '.vscode-server/data/User/globalStorage/kilocode.kilo-code/tasks': 'kilocode',
+  '.commandcode/projects': 'commandcode',
+  '.dsh/sessions': 'dsh',
   '.local/share/mimocode/mimocode.db': 'micode',
   '.zcode/projects': 'zcode',
+  '.zcode/cli/db': 'zcode',
   '.kiro/sessions': 'kiro',
   '.local/share/kiro-cli/data.sqlite3': 'kiro',
   '.config/Kiro/User/globalStorage/kiro.kiroagent': 'kiro',
   '.config/kiro/User/globalStorage/kiro.kiroagent': 'kiro',
   '.codebuddy/projects': 'codebuddy',
   '.workbuddy': 'workbuddy',
-  '.proma/agent-sessions': 'proma'
+  '.proma/agent-sessions': 'proma',
+  '.lmstudio/server-logs': 'lmstudio',
+  '.unsloth/studio/studio.db': 'unsloth'
 };
 
 // Default command runner. reg output is ANSI/utf8; wsl.exe output is UTF-16LE.
@@ -198,12 +210,20 @@ async function collectWslUsage(options = {}, deps = {}) {
   const readdirSync = deps.readdirSync || fs.readdirSync;
   const bundle = emptyWslBundle();
   const detected = new Set();
+  throwIfAborted(options.signal, 'WSL usage scan aborted');
   if (!trackedClients) return { bundle, detected: [] };
   // Only attribute markers for clients the user is actually tracking — a marker
   // for an untracked client must not surface in the panel.
+  // Reasonix aggregate usage is supported on the host, but remains excluded
+  // from WSL scans: Tokscale's Windows PathRoot::ReasonixHome conflicts with
+  // the Linux-default `.reasonix/stats` path inside WSL. Native session files
+  // are local-only as well.
   const tracked = new Set(String(trackedClients).split(',').map((c) => c.trim()).filter(Boolean));
-  const clientsCsv = String(clients || '').split(',').map((c) => c.trim()).filter(Boolean).join(',');
+  const clientsCsv = String(clients || '').split(',').map((c) => c.trim()).filter(Boolean)
+    .filter((client) => client !== REASONIX_CLIENT)
+    .join(',');
   for (const home of wslUsageHomes(deps)) {
+    throwIfAborted(options.signal, 'WSL usage scan aborted');
     // Attribution is marker-based, independent of whether a parser returns data.
     const homeDataClients = homeHasData(home, existsSync, readdirSync);
     for (const id of homeDataClients) {
@@ -241,9 +261,12 @@ async function collectWslUsage(options = {}, deps = {}) {
     if (clientsCsv.length === 0 || typeof runTokscale !== 'function') continue;
     try {
       // Serial on purpose (issue #15): never run these concurrently.
-      const todayJson = await runTokscale({ clients: clientsCsv, flags: ['--today', '--home', home], commandTimeoutMs });
-      const monthJson = await runTokscale({ clients: clientsCsv, flags: ['--month', '--home', home], commandTimeoutMs });
-      const allTimeJson = await runTokscale({ clients: clientsCsv, flags: ['--since', allTimeSince, '--home', home], commandTimeoutMs });
+      const todayJson = await runTokscale({ clients: clientsCsv, flags: ['--today', '--home', home], commandTimeoutMs, signal: options.signal });
+      throwIfAborted(options.signal, 'WSL usage scan aborted');
+      const monthJson = await runTokscale({ clients: clientsCsv, flags: ['--month', '--home', home], commandTimeoutMs, signal: options.signal });
+      throwIfAborted(options.signal, 'WSL usage scan aborted');
+      const allTimeJson = await runTokscale({ clients: clientsCsv, flags: ['--since', allTimeSince, '--home', home], commandTimeoutMs, signal: options.signal });
+      throwIfAborted(options.signal, 'WSL usage scan aborted');
       const periods = {
         today: extractUsageFromTokscale(todayJson),
         month: extractUsageFromTokscale(monthJson),
@@ -254,6 +277,7 @@ async function collectWslUsage(options = {}, deps = {}) {
       bundle.month = mergePeriods(bundle.month, periods.month);
       bundle.allTime = mergePeriods(bundle.allTime, periods.allTime);
     } catch (error) {
+      throwIfAborted(options.signal, 'WSL usage scan aborted');
       if (typeof logger === 'function') logger(`wsl usage scan failed for ${home}: ${error.message}`);
     }
   }

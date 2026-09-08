@@ -6,12 +6,15 @@
     typeof module === 'object' && module.exports ? require('./trayText') : root?.TokenMonitorTrayText,
     typeof module === 'object' && module.exports
       ? require('./limitBalanceDisplay')
-      : root?.TokenMonitorLimitBalanceDisplay
+      : root?.TokenMonitorLimitBalanceDisplay,
+    typeof module === 'object' && module.exports
+      ? require('./compactMoney')
+      : root?.TokenMonitorCompactMoney
   );
   if (typeof module === 'object' && module.exports) module.exports = api;
   if (root) root.TokenMonitorTrayLayout = api;
-})(typeof window !== 'undefined' ? window : globalThis, function createTrayLayoutApi(currencyApi, trayTextApi, balanceDisplay) {
-  const VERSION = 2;
+})(typeof window !== 'undefined' ? window : globalThis, function createTrayLayoutApi(currencyApi, trayTextApi, balanceDisplay, compactMoneyApi) {
+  const VERSION = 3;
   const MAX_ITEMS = 12;
   const STYLE_IDS = Object.freeze([
     'appIcon',
@@ -41,12 +44,14 @@
   const STACK_METRICS = new Set(['percent', 'reset', 'mixed', 'custom']);
   const STACK_ALIGNMENTS = new Set(['left', 'right']);
   const FONT_STYLES = new Set(['normal', 'condensed', 'menubar', 'compactMono']);
-  const ICON_AUTO_MODES = new Set(['lowestLimit', 'tokens', 'cost']);
+  const ICON_AUTO_MODES = new Set(['lowestLimit', 'recent', 'tokens', 'cost']);
   const BAR_ICON_MODES = new Set(['app', 'first', 'second', 'none']);
   const SPACER_SIZES = new Set(['narrow', 'regular', 'wide']);
   const SPACER_VARIANTS = new Set(['space', 'dot']);
+  const COST_FORMATS = new Set(['compact', 'full']);
+  const USAGE_SCOPES = new Set(['all', 'recent']);
   const PERIODS = new Set(['today', 'month', 'allTime']);
-  const WINDOW_PRESETS = new Set(['primary', 'secondary', 'session', 'weekly', 'billing']);
+  const WINDOW_PRESETS = new Set(['primary', 'secondary', 'session', 'daily', 'weekly', 'billing']);
 
   function clean(value, max = 160) {
     return String(value || '').trim().slice(0, max);
@@ -107,36 +112,74 @@
     };
   }
 
+  function normalizeCostDisplay(input = {}, defaults = {}) {
+    const format = clean(input.costFormat, 24);
+    const defaultFormat = COST_FORMATS.has(defaults.costFormat) ? defaults.costFormat : 'compact';
+    const defaultDecimals = defaults.costDecimals === 'auto' ? 'auto' : 2;
+    const decimals = input.costDecimals === 'auto'
+      ? 'auto'
+      : input.costDecimals === null || input.costDecimals === '' || input.costDecimals === undefined
+        ? defaultDecimals
+        : finite(input.costDecimals);
+    return {
+      costFormat: COST_FORMATS.has(format) ? format : defaultFormat,
+      costDecimals: decimals === 'auto'
+        ? 'auto'
+        : decimals === null ? defaultDecimals : Math.max(0, Math.min(4, Math.round(decimals)))
+    };
+  }
+
+  function normalizeUsageScope(value) {
+    const scope = clean(value, 24);
+    return USAGE_SCOPES.has(scope) ? scope : 'all';
+  }
+
   function normalizeSource(input, fallbackWindow = 'primary') {
     const source = input && typeof input === 'object' ? input : {};
     const provider = clean(source.provider, 48).toLowerCase();
     const accountMode = clean(source.accountMode, 24);
     const valueMode = clean(source.valueMode, 24);
-    return {
+    const normalized = {
       provider: provider || 'auto',
       accountMode: ACCOUNT_MODES.has(accountMode) ? accountMode : 'lowest',
       accountKey: clean(source.accountKey),
       window: normalizeWindowSelector(source.window, fallbackWindow),
       valueMode: VALUE_MODES.has(valueMode) ? valueMode : 'remaining'
     };
+    // Balance stays the default headline for compatibility. Persist only the
+    // explicit percentage opt-in so older layouts keep their compact shape.
+    if (source.creditsDisplay === 'percent') normalized.creditsDisplay = 'percent';
+    return normalized;
   }
 
   function infoRowDefaults(metric = 'percent', window = 'primary') {
-    return {
+    const row = {
       ...sourceDefaults(window),
       metric: INFO_METRICS.has(metric) ? metric : 'percent',
       period: 'today'
     };
+    if (row.metric === 'cost') return { ...row, usageScope: 'all', ...normalizeCostDisplay() };
+    return row.metric === 'tokens' ? { ...row, usageScope: 'all' } : row;
   }
 
-  function normalizeInfoRow(input, fallbackMetric = 'percent', fallbackWindow = 'primary') {
+  function normalizeInfoRow(input, fallbackMetric = 'percent', fallbackWindow = 'primary', options = {}) {
     const row = input && typeof input === 'object' ? input : {};
     const metric = clean(row.metric, 24);
-    return {
+    const normalized = {
       ...normalizeSource(row, fallbackWindow),
       metric: INFO_METRICS.has(metric) ? metric : fallbackMetric,
       period: PERIODS.has(row.period) ? row.period : 'today'
     };
+    if (normalized.metric === 'cost') {
+      return {
+        ...normalized,
+        usageScope: normalizeUsageScope(row.usageScope),
+        ...normalizeCostDisplay(row, options.costDefaults)
+      };
+    }
+    return normalized.metric === 'tokens'
+      ? { ...normalized, usageScope: normalizeUsageScope(row.usageScope) }
+      : normalized;
   }
 
   function normalizeBarIcon(value, rowCount = 1) {
@@ -275,7 +318,7 @@
       cost: 'cost',
       account: 'account'
     }[styleId];
-    return {
+    const item = {
       id,
       type: 'text',
       style: styleId,
@@ -284,9 +327,11 @@
       period: 'today',
       source: sourceDefaults()
     };
+    if (metric === 'cost') return { ...item, usageScope: 'all', ...normalizeCostDisplay() };
+    return metric === 'tokens' ? { ...item, usageScope: 'all' } : item;
   }
 
-  function normalizeItem(input, index = 0) {
+  function normalizeItem(input, index = 0, options = {}) {
     if (!input || typeof input !== 'object') return null;
     const type = clean(input.type, 24);
     if (!ITEM_TYPES.has(type)) return null;
@@ -354,7 +399,8 @@
         const normalizedRows = rows.map((row, rowIndex) => normalizeInfoRow(
           row,
           rowIndex === 0 ? 'percent' : 'reset',
-          'primary'
+          'primary',
+          options
         ));
         while (normalizedRows.length < 2) {
           normalizedRows.push(infoRowDefaults(normalizedRows.length === 0 ? 'percent' : 'reset'));
@@ -414,7 +460,7 @@
       };
     }
     const period = PERIODS.has(input.period) ? input.period : 'today';
-    return {
+    const normalized = {
       id,
       type,
       style: STYLE_SET.has(style) ? style : metric,
@@ -423,6 +469,16 @@
       period,
       source: normalizeSource(input.source)
     };
+    if (metric === 'cost') {
+      return {
+        ...normalized,
+        usageScope: normalizeUsageScope(input.usageScope),
+        ...normalizeCostDisplay(input, options.costDefaults)
+      };
+    }
+    return metric === 'tokens'
+      ? { ...normalized, usageScope: normalizeUsageScope(input.usageScope) }
+      : normalized;
   }
 
   function uniqueItemId(value, usedIds) {
@@ -453,8 +509,12 @@
     }
     const items = [];
     const usedIds = new Set();
+    const sourceVersion = finite(input.version);
+    const normalizeOptions = sourceVersion === null || sourceVersion < 3
+      ? { costDefaults: { costFormat: 'full', costDecimals: 'auto' } }
+      : {};
     for (const candidate of Array.isArray(input.items) ? input.items : []) {
-      const item = normalizeItem(candidate, items.length);
+      const item = normalizeItem(candidate, items.length, normalizeOptions);
       if (!item) continue;
       item.id = uniqueItemId(item.id, usedIds);
       usedIds.add(item.id);
@@ -623,8 +683,16 @@
 
   function meteredWindows(provider) {
     return (provider?.windows || []).filter((window) => (
-      window && window.showMeter !== false && windowPercent(provider, window) !== null
+      window
+      && window.showMeter !== false
+      && isCanonicalCodexWindow(provider, window)
+      && windowPercent(provider, window) !== null
     ));
+  }
+
+  function isCanonicalCodexWindow(provider, window) {
+    if (providerId(provider) !== 'codex') return true;
+    return window?.additional !== true;
   }
 
   function preferredWindow(provider, kind) {
@@ -644,10 +712,11 @@
     if (normalized.startsWith('exact|')) {
       return meteredWindows(provider).find((window) => windowKey(window) === normalized) || null;
     }
-    if (normalized === 'session' || normalized === 'weekly' || normalized === 'billing') {
+    if (normalized === 'session' || normalized === 'daily' || normalized === 'weekly' || normalized === 'billing') {
       return preferredWindow(provider, normalized);
     }
     const primary = preferredWindow(provider, 'session')
+      || preferredWindow(provider, 'daily')
       || preferredWindow(provider, 'weekly')
       || preferredWindow(provider, 'billing')
       || meteredWindows(provider)[0]
@@ -714,6 +783,18 @@
     return percent === null ? '--' : `${Math.round(percent)}%`;
   }
 
+  function formatSelectionHeadline(selection) {
+    if (!selection) return '--';
+    const useCreditsPercent = Boolean(
+      selection.moneyText
+      && selection.source?.creditsDisplay === 'percent'
+      && selection.percent !== null
+    );
+    return useCreditsPercent || !selection.moneyText
+      ? formatPercent(selection.percent)
+      : selection.moneyText;
+  }
+
   function formatResetCountdown(value, nowMs = Date.now()) {
     const resetMs = Date.parse(value || '');
     const current = Number(nowMs);
@@ -749,24 +830,63 @@
     return String(number);
   }
 
-  function resolveTextItem(item, stats, options) {
+  function formatCost(value, item, options) {
+    const display = normalizeCostDisplay(item);
+    if (!compactMoneyApi?.formatCompactCurrencyFromUsd) {
+      return currencyApi?.formatCurrencyFromUsd?.(value, options.currency || 'USD')
+        || String(Number(value) || 0);
+    }
+    return compactMoneyApi.formatCompactCurrencyFromUsd(
+      value,
+      options.currency || 'USD',
+      options.compactTokenUnits,
+      options.locale || options.language || 'en',
+      {
+        compact: display.costFormat !== 'full',
+        fractionDigits: display.costDecimals
+      }
+    );
+  }
+
+  function resolveUsageValue(item, stats, recentProvider) {
+    const period = stats?.periods?.[item.period] || {};
+    if (normalizeUsageScope(item.usageScope) !== 'recent') {
+      return {
+        available: true,
+        provider: null,
+        value: item.metric === 'tokens' ? period.totalTokens : period.costUsd
+      };
+    }
+    const provider = recentProvider || null;
+    if (!provider) return { available: false, provider: null, value: 0 };
+    return {
+      available: true,
+      provider,
+      value: item.metric === 'tokens'
+        ? Number(period.clients?.[provider]) || 0
+        : Number(period.clientCosts?.[provider]) || 0
+    };
+  }
+
+  function resolveTextItem(item, stats, options, recentProvider = null) {
     if (item.metric === 'custom') {
       const text = clean(item.text, 40);
       return { ...item, available: Boolean(text), text: text || '--' };
     }
     if (item.metric === 'tokens' || item.metric === 'cost') {
-      const period = stats?.periods?.[item.period] || {};
+      const usage = resolveUsageValue(item, stats, recentProvider);
+      if (!usage.available) {
+        return { ...item, available: false, text: '--', provider: null };
+      }
       const text = item.metric === 'tokens'
-        ? formatCompactNumber(period.totalTokens, options)
-        : currencyApi?.formatCurrencyFromUsd
-          ? currencyApi.formatCurrencyFromUsd(period.costUsd, options.currency || 'USD')
-          : String(Number(period.costUsd) || 0);
-      return { ...item, available: true, text };
+        ? formatCompactNumber(usage.value, options)
+        : formatCost(usage.value, item, options);
+      return { ...item, available: true, text, provider: usage.provider };
     }
     const selection = selectSource(stats, item.source, options);
     if (!selection) return { ...item, available: false, text: '--', selection: null };
     const reset = formatResetCountdown(selection.window.resetsAt, options.nowMs);
-    const headline = selection.moneyText || formatPercent(selection.percent);
+    const headline = formatSelectionHeadline(selection);
     let text;
     if (item.metric === 'percent') text = headline;
     else if (item.metric === 'percentReset') text = [headline, reset].filter(Boolean).join(' · ');
@@ -775,8 +895,29 @@
     return { ...item, available: Boolean(text && text !== '--'), text: text || '--', selection };
   }
 
+  function preferredRowProvider(rows, preferredIndex = 0) {
+    const providerFor = (row) => clean(row?.selection?.provider || row?.provider, 48).toLowerCase();
+    const preferred = Array.isArray(rows) ? rows[preferredIndex] : null;
+    return providerFor(preferred)
+      || providerFor((rows || []).find((row) => providerFor(row)))
+      || '';
+  }
+
   function resolveTrayLayout(layout, stats, options = {}) {
     const normalized = normalizeTrayLayout(layout);
+    const usesRecentProvider = normalized.items.some((item) => (
+      (item.type === 'icon' && item.autoMode === 'recent')
+      || (item.type === 'text' && item.usageScope === 'recent')
+      || (item.type === 'stack' && item.metric === 'mixed'
+        && item.rows.some((row) => row.usageScope === 'recent'))
+    ));
+    const recentProvider = usesRecentProvider
+      ? trayTextApi?.pickRecentUsageProviderId?.(stats) || null
+      : null;
+    const recentIconProvider = recentProvider && (
+      !Array.isArray(options.availableProviderIds)
+      || options.availableProviderIds.includes(recentProvider)
+    ) ? recentProvider : null;
     return {
       version: VERSION,
       items: normalized.items.map((item) => {
@@ -791,17 +932,19 @@
               selection: null
             };
           }
-          if (item.autoMode === 'tokens' || item.autoMode === 'cost') {
-            const provider = trayTextApi?.pickUsageProviderId?.(
-              stats,
-              item.autoMode,
-              item.period,
-              options.availableProviderIds
-            ) || 'app';
+          if (item.autoMode === 'recent' || item.autoMode === 'tokens' || item.autoMode === 'cost') {
+            const provider = item.autoMode === 'recent'
+              ? recentIconProvider
+              : trayTextApi?.pickUsageProviderId?.(
+                  stats,
+                  item.autoMode,
+                  item.period,
+                  options.availableProviderIds
+                );
             return {
               ...item,
               available: true,
-              provider,
+              provider: provider || 'app',
               selection: null
             };
           }
@@ -837,16 +980,18 @@
           if (item.metric === 'mixed') {
             const rows = item.rows.map((source) => {
               const resolved = resolveTextItem({
+                ...source,
                 type: 'text',
                 style: source.metric,
                 metric: source.metric,
                 period: source.period,
                 source
-              }, stats, options);
+              }, stats, options, recentProvider);
               return {
                 source,
                 available: resolved.available,
                 text: resolved.text,
+                provider: resolved.provider || null,
                 selection: resolved.selection || null
               };
             });
@@ -858,7 +1003,7 @@
               ? '--'
               : item.metric === 'reset'
                 ? formatResetCountdown(selection.window.resetsAt, options.nowMs) || '--'
-                : formatPercent(selection.percent);
+                : formatSelectionHeadline(selection);
             return {
               source,
               available: Boolean(selection && text !== '--'),
@@ -869,7 +1014,7 @@
           return { ...item, available: rows.some((row) => row.available), rows };
         }
         if (item.type === 'spacer') return { ...item, available: true };
-        return resolveTextItem(item, stats, options);
+        return resolveTextItem(item, stats, options, recentProvider);
       })
     };
   }
@@ -888,6 +1033,7 @@
     normalizeSource,
     normalizeTrayLayout,
     providerOptions,
+    preferredRowProvider,
     removeTrayLayoutItem,
     replaceTrayLayoutItem,
     resolveTrayLayout,

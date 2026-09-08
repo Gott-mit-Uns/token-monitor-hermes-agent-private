@@ -25,6 +25,9 @@
 // Node-builtin-free: this module is vendored into worker/src/shared/ by
 // `npm run sync:worker`.
 
+const { REASONIX_SOURCE_CHECK_ID } = require('./reasonixPaths');
+const { DSH_SOURCE_CHECK_ID } = require('./dshPaths');
+
 const CLIENT_HEALTH_VERSION = 1;
 
 // healthy      — usage was observed for this client
@@ -67,6 +70,7 @@ const CLIENT_SYNC_DETAIL_CODES = Object.freeze([
   'network-timeout',
   'network-failed',
   'authentication-failed',
+  'sync-lock-present',
   'unknown'
 ]);
 const CLIENT_SYNC_DETAIL_CODE_SET = new Set(CLIENT_SYNC_DETAIL_CODES);
@@ -145,6 +149,12 @@ function classifyClientSyncDetailCode({ client = '', text = '' } = {}) {
   ) {
     return 'rpc-failed';
   }
+  if (
+    client === 'antigravity'
+    && /antigravity sync lock at .* already exists/.test(message)
+  ) {
+    return 'sync-lock-present';
+  }
   if (/failed to connect|connection refused|connection reset|could not resolve|\bdns\b|\bnetwork\b/.test(message)) {
     return 'network-failed';
   }
@@ -164,14 +174,21 @@ const CLIENT_SOURCE_CHECK_IDS = Object.freeze([
   'wsl-home',
   'antigravity-cli-data',
   'antigravity-ide-source',
+  'cherrystudio-transcripts',
   'claude-projects',
   'claude-transcripts',
+  'cline-cli-sessions',
   'cline-tasks',
   'codebuddy-extension-logs',
   'codebuddy-projects',
   'codex-sessions',
+  'commandcode-projects',
+  'copilot-data',
   'copilot-otel',
+  'copilot-otel-exporter',
+  DSH_SOURCE_CHECK_ID,
   'grok-sessions',
+  'grok-unified-log',
   'hermes-home',
   'hermes-profile',
   'kilocode-tasks',
@@ -180,6 +197,7 @@ const CLIENT_SOURCE_CHECK_IDS = Object.freeze([
   'kiro-cli-data',
   'kiro-ide-globalstorage',
   'kiro-sessions',
+  'lmstudio-server-logs',
   'mimocode-data',
   'mimocode-orca-data',
   'omp-sessions',
@@ -187,11 +205,15 @@ const CLIENT_SOURCE_CHECK_IDS = Object.freeze([
   'openclaw-agents',
   'pi-sessions',
   'proma-sessions',
+  'qodercn-db',
+  REASONIX_SOURCE_CHECK_ID,
   'qwen-projects',
   'tokscale-antigravity-cache',
   'tokscale-cursor-cache',
+  'unsloth-db',
   'vscode-workspace-storage',
   'workbuddy-projects',
+  'zcode-cli-db',
   'zcode-projects',
   'zed-threads'
 ]);
@@ -210,6 +232,7 @@ const CLIENT_HEALTH_DIAGNOSTIC_CODES = Object.freeze([
   'sync-timeout',          // self-sync was killed after its deadline
   'sync-spawn-failed',     // the self-sync subprocess could not be started
   'sync-exit-error',       // the self-sync subprocess exited non-zero
+  'sync-lock-present',     // an existing Antigravity sync lock blocked the subprocess
   'no-usage-observed',     // sources are present, all-time usage is zero
   'wsl-detected-no-data'   // a WSL marker was found but the scan returned nothing
 ]);

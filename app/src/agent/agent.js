@@ -2,18 +2,20 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { isDeepStrictEqual } = require('node:util');
 const { defaultDeviceId, loadDotEnv, parseArgs, pidFilePath } = require('../shared/config');
 const { appVersion } = require('../shared/appVersion');
 const { clientsCsvForSetting } = require('../shared/clientTracking');
 const { normalizeHistoryIntervalMs } = require('../shared/collector');
-const { normalizeLimitsRefreshMs, parseBoolean, parseLimitProviders } = require('../shared/limitCollector');
+const {
+  normalizeLimitsRefreshMode,
+  normalizeLimitsRefreshMs,
+  parseBoolean,
+  parseLimitProviders
+} = require('../shared/limitCollector');
 const { postSyncPayload } = require('../shared/syncPayload');
 const { applyProjectRollups } = require('../shared/usage');
 const { runAgent, runAgentOnce } = require('./runtime');
-const { createDeduplicatingDelivery, writeAgentSuccess } = require('./deliveryPolicy');
-const { createDeviceIdMigration } = require('./deviceIdMigration');
-const { createThrottledWriter } = require('./throttledWriter');
+const { mark } = require('./nasHealth');
 const {
   applySessionUsageArchive,
   captureSessionUsageArchive,
@@ -36,10 +38,29 @@ const commandTimeoutMs = Number(args.timeoutMs || process.env.TOKEN_MONITOR_TOKS
 const limitsEnabled = parseBoolean(args.limits ?? args.limitsEnabled ?? process.env.TOKEN_MONITOR_LIMITS_ENABLED, true);
 const limitProviders = parseLimitProviders(args.limitProviders ?? process.env.TOKEN_MONITOR_LIMIT_PROVIDERS).join(',');
 const limitsRefreshMs = normalizeLimitsRefreshMs(args.limitsRefreshMs || process.env.TOKEN_MONITOR_LIMITS_REFRESH_MS);
+const limitsRefreshMode = normalizeLimitsRefreshMode(args.limitsRefreshMode || process.env.TOKEN_MONITOR_LIMITS_REFRESH_MODE);
 const historyEnabled = parseBoolean(args.history ?? args.historyEnabled ?? process.env.TOKEN_MONITOR_HISTORY_ENABLED, true);
 const projectsEnabled = parseBoolean(args.projects ?? args.projectsEnabled ?? process.env.TOKEN_MONITOR_PROJECTS_ENABLED, false);
 const sessionUsageArchiveEnabled = parseBoolean(args.sessionArchive ?? args.sessionUsageArchiveEnabled ?? process.env.TOKEN_MONITOR_SESSION_USAGE_ARCHIVE_ENABLED, true);
 const wslScanEnabled = parseBoolean(args.wslScan ?? args.wslScanEnabled ?? process.env.TOKEN_MONITOR_WSL_SCAN, true);
+const opencodeLocalLimitsEnabled = parseBoolean(
+  args['opencode-local-limits']
+    ?? args.opencodeLocalLimits
+    ?? args.opencodeLocalLimitsEnabled
+    ?? process.env.TOKEN_MONITOR_OPENCODE_LOCAL_LIMITS,
+  false
+);
+// The key OpenCode stores for itself needs no configuration, so an unattended
+// agent reports it by default. Switched off for a machine signed in to an
+// account whose quota should not leave it. The widget resolves the same setting
+// through settings.json; here it is env or flag, like every other agent option.
+const opencodeAmbientEnabled = parseBoolean(
+  args['opencode-ambient']
+    ?? args.opencodeAmbient
+    ?? args.opencodeAmbientEnabled
+    ?? process.env.TOKEN_MONITOR_OPENCODE_AMBIENT,
+  true
+);
 const opencodeCookie = String(process.env.TOKEN_MONITOR_OPENCODE_COOKIE || '').trim();
 const once = Boolean(args.once);
 const dryRun = Boolean(args['dry-run'] || args.dryRun);
@@ -67,41 +88,31 @@ const usageOptions = {
 const limitsOptions = {
   limitsEnabled,
   limitProviders,
+  limitsRefreshMode,
   limitsRefreshMs,
   claudeWebCookie: '',
+  opencodeLocalLimitsEnabled,
+  opencodeAmbientEnabled,
   opencodeCookie
 };
 let sessionUsageArchive;
-let sessionArchiveWriter;
-const deviceIdMigration = createDeviceIdMigration({ currentDeviceId: deviceId, hubUrl, secret, fetch });
-
-function ensureSessionArchive() {
-  if (sessionUsageArchive) return;
-  sessionUsageArchive = readSessionUsageArchive();
-  sessionArchiveWriter = createThrottledWriter({
-    intervalMs: Math.max(60 * 1000, intervalMs),
-    write: writeSessionUsageArchive,
-    onError: (error) => console.error(`[session-archive] write failed: ${error.message}`)
-  });
-}
-
-function flushSessionArchive() {
-  if (!sessionArchiveWriter) return;
-  try { sessionArchiveWriter.flush(); } catch (error) {
-    console.error(`[session-archive] final write failed: ${error.message}`);
-  }
-}
 
 function summaryWithSessionUsageArchive(summary, now = new Date()) {
+  if (!dryRun) mark('collectedAt');
   let visibleSummary = summary;
   if (sessionUsageArchiveEnabled) {
-    ensureSessionArchive();
     const archiveDate = sessionUsageArchiveDate(summary, now);
-    const previous = sessionUsageArchive;
+    const previous = sessionUsageArchive || readSessionUsageArchive();
     const next = captureSessionUsageArchive(previous, summary, archiveDate);
-    if (!dryRun && !isDeepStrictEqual(next, previous)) {
+    if (!dryRun && JSON.stringify(next) !== JSON.stringify(previous)) {
+      try {
+        writeSessionUsageArchive(next);
+        sessionUsageArchive = next;
+      } catch (error) {
+        console.error(`[session-archive] write failed: ${error.message}`);
+      }
+    } else if (!dryRun) {
       sessionUsageArchive = next;
-      sessionArchiveWriter.update(next);
     }
     visibleSummary = applySessionUsageArchive(summary, next, { now: archiveDate });
   }
@@ -115,41 +126,25 @@ async function postUsage(summary) {
     logger: (message) => console.warn(`[sync] ${message}`)
   });
   if (!response.ok) throw new Error(`Hub responded ${response.status}: ${(await response.text()).slice(0, 300)}`);
-  const result = await response.json();
-  await deviceIdMigration.migrateAfterSuccessfulPost();
-  return result;
+  return response.json();
 }
-
-const deliveryPolicy = createDeduplicatingDelivery({
-  heartbeatMs: intervalMs,
-  send: postUsage,
-  onSuccess: () => {
-    try { writeAgentSuccess(); } catch (error) {
-      console.error(`[health] cannot update last-success: ${error.message}`);
-    }
-  }
-});
 
 async function deliver(summary) {
   if (dryRun) { console.log(JSON.stringify(summary, null, 2)); return; }
-  const outcome = await deliveryPolicy.deliver(summary);
-  if (!outcome.sent) return;
+  await postUsage(summary);
+  mark('uploadedAt');
   console.log(`[${new Date().toISOString()}] posted ${summary.deviceId}: today=${summary.today.totalTokens} month=${summary.month.totalTokens} allTime=${summary.allTime.totalTokens}`);
 }
 
 function registerPidFile(stopRuntime) {
   const pidPath = pidFilePath();
   fs.mkdirSync(path.dirname(pidPath), { recursive: true });
-  fs.writeFileSync(pidPath, String(process.pid), { encoding: 'utf8', mode: 0o600 });
+  fs.writeFileSync(pidPath, String(process.pid), 'utf8');
   const cleanup = () => { try { fs.unlinkSync(pidPath); } catch (_) {} };
-  process.on('exit', () => {
-    flushSessionArchive();
-    cleanup();
-  });
+  process.on('exit', cleanup);
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     process.on(sig, () => {
       try { stopRuntime?.(); } catch (_) {}
-      flushSessionArchive();
       cleanup();
       process.exit(0);
     });
@@ -157,7 +152,7 @@ function registerPidFile(stopRuntime) {
 }
 
 async function main() {
-  const startupMessage = `Token Monitor agent device=${deviceId} hub=${hubUrl} intervalMs=${intervalMs} watch=${watchEnabled} projects=${projectsEnabled ? 'on' : 'off'} history=${historyEnabled ? 'on' : 'off'} sessionArchive=${sessionUsageArchiveEnabled ? 'on' : 'off'} limits=${limitsEnabled ? `${limitProviders || 'none'}:${limitsRefreshMs}ms` : 'off'}`;
+  const startupMessage = `Token Monitor agent device=${deviceId} hub=${hubUrl} intervalMs=${intervalMs} watch=${watchEnabled} projects=${projectsEnabled ? 'on' : 'off'} history=${historyEnabled ? 'on' : 'off'} sessionArchive=${sessionUsageArchiveEnabled ? 'on' : 'off'} limits=${limitsEnabled ? `${limitProviders || 'none'}:${limitsRefreshMode === 'adaptive' ? 'adaptive' : `${limitsRefreshMs}ms`}` : 'off'}`;
   if (dryRun) console.error(startupMessage);
   else console.log(startupMessage);
   if (!secret) console.warn('Warning: TOKEN_MONITOR_SECRET is not set. Posting without authorization header.');

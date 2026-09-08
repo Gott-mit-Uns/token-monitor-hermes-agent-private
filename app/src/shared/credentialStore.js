@@ -24,7 +24,14 @@ const CREDENTIAL_SETTING_PATHS = Object.freeze({
   zaiTeamProjectId: ['providers', 'zaiTeam', 'projectId'],
   volcengineAccessKeyId: ['providers', 'volcengine', 'accessKeyId'],
   volcengineSecretAccessKey: ['providers', 'volcengine', 'secretAccessKey'],
+  volcengineAgentAccessKeyId: ['providers', 'volcengine', 'agentAccessKeyId'],
+  volcengineAgentSecretAccessKey: ['providers', 'volcengine', 'agentSecretAccessKey'],
+  alibabaCookie: ['providers', 'alibaba', 'cookie'],
   qoderCookie: ['providers', 'qoder', 'cookie'],
+  traeAccessToken: ['providers', 'trae', 'accessToken'],
+  traeDeviceId: ['providers', 'trae', 'deviceId'],
+  zedCookie: ['providers', 'zed', 'cookie'],
+  commandcodeCookie: ['providers', 'commandcode', 'cookie'],
   kimiApiKey: ['providers', 'kimi', 'apiKey'],
   kimiWebAccessToken: ['providers', 'kimi', 'webAccessToken'],
   ollamaCookie: ['providers', 'ollama', 'cookie'],
@@ -120,11 +127,34 @@ function readRegularFileNoFollow(filePath, options = {}) {
     descriptor = fsApi.openSync(filePath, constants.O_RDONLY | noFollow);
     const descriptorStat = fsApi.fstatSync(descriptor);
     if (!descriptorStat.isFile()) throw new Error(`${description} must be a regular file`);
+    const maxBytes = Number.isFinite(options.maxBytes)
+      ? Math.max(0, Math.floor(options.maxBytes))
+      : null;
+    if (maxBytes !== null && descriptorStat.size > maxBytes) {
+      throw new Error(`${description} exceeds ${maxBytes} bytes`);
+    }
     if (pathStat && (pathStat.dev !== descriptorStat.dev || pathStat.ino !== descriptorStat.ino)) {
       throw new Error(`${description} changed while it was being opened`);
     }
     if (options.mode !== undefined && process.platform !== 'win32') {
       fsApi.fchmodSync(descriptor, options.mode);
+    }
+    if (maxBytes !== null) {
+      const buffer = Buffer.allocUnsafe(maxBytes + 1);
+      let bytesRead = 0;
+      while (bytesRead < buffer.length) {
+        const count = fsApi.readSync(
+          descriptor,
+          buffer,
+          bytesRead,
+          buffer.length - bytesRead,
+          null
+        );
+        if (count === 0) break;
+        bytesRead += count;
+      }
+      if (bytesRead > maxBytes) throw new Error(`${description} exceeds ${maxBytes} bytes`);
+      return buffer.subarray(0, bytesRead).toString(options.encoding || 'utf8');
     }
     return fsApi.readFileSync(descriptor, options.encoding || 'utf8');
   } catch (error) {
@@ -331,6 +361,31 @@ class CredentialStore {
     deleteValueAt(document.credentials, ['providers', 'mimo', 'accounts', accountId]);
     this.writeDocument(document);
     return !this.readMimoCredential(accountId);
+  }
+
+  readAntigravityCredential(id, document = this.readDocument()) {
+    const accountId = safeDynamicKey(id);
+    if (!accountId) return null;
+    const value = valueAt(document.credentials, ['providers', 'antigravity', 'accounts', accountId, 'credentials']);
+    return isObject(value) ? cloneJson(value) : null;
+  }
+
+  writeAntigravityCredential(id, credentials) {
+    const accountId = safeDynamicKey(id);
+    if (!accountId || !credentialValuePresent(credentials)) return false;
+    const document = this.readDocument();
+    setValueAt(document.credentials, ['providers', 'antigravity', 'accounts', accountId, 'credentials'], credentials);
+    this.writeDocument(document);
+    return true;
+  }
+
+  removeAntigravityCredential(id) {
+    const accountId = safeDynamicKey(id);
+    if (!accountId) return false;
+    const document = this.readDocument();
+    deleteValueAt(document.credentials, ['providers', 'antigravity', 'accounts', accountId]);
+    this.writeDocument(document);
+    return !this.readAntigravityCredential(accountId);
   }
 
   migrateLegacyMimoCredentials(entries) {

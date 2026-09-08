@@ -3,24 +3,32 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.io/gott-mit-uns/token-monitor-hermes-agent:0.42.0-nas.2
+    image: token-monitor-hermes-agent:0.54.0-nas.1
     container_name: token-monitor-hermes-agent
     restart: unless-stopped
     init: true
-    user: "65532:10000"
+    # The NAS ACL protects the Hermes directory. Run as its owner, with only
+    # DAC_READ_SEARCH restored so the agent can read and watch this read-only bind.
+    user: "0:0"
     env_file:
       - .env
     environment:
       HERMES_HOME: /hermes
       HOME: /config
       XDG_CONFIG_HOME: /config
-      TOKEN_MONITOR_DEVICE_ID: Hermes-NAS
+      TOKEN_MONITOR_DEVICE_ID: Hermes-NAS-4800
       TOKEN_MONITOR_CLIENTS: hermes
+      TOKEN_MONITOR_INTERVAL_MS: "300000"
       TOKEN_MONITOR_PROJECTS_ENABLED: "0"
       TOKEN_MONITOR_LIMITS_ENABLED: "0"
+      TOKEN_MONITOR_HISTORY_ENABLED: "1"
+      TOKEN_MONITOR_SESSION_USAGE_ARCHIVE_ENABLED: "1"
+      # Native events speed up updates; the 5-minute collector interval remains
+      # as a fallback when no filesystem event arrives.
+      TOKEN_MONITOR_WATCH: "1"
       TOKEN_MONITOR_WATCH_DEBOUNCE_MS: "30000"
     mem_limit: 512m
-    cpus: 1.00
+    cpus: 0.50
     pids_limit: 64
     logging:
       driver: json-file
@@ -30,6 +38,8 @@ services:
     read_only: true
     cap_drop:
       - ALL
+    cap_add:
+      - DAC_READ_SEARCH
     security_opt:
       - no-new-privileges:true
     tmpfs:
@@ -38,7 +48,10 @@ services:
       - /volume1/docker/hermes:/hermes:ro
       - /volume1/docker/token-monitor-hermes-agent/state:/config
     healthcheck:
-      test: ["CMD-SHELL", "test -s '/config/Token Monitor/agent.pid' && kill -0 \"$(cat '/config/Token Monitor/agent.pid')\" && node -e \"const s=require('node:fs').statSync('/config/Token Monitor/last-success'); process.exit(Date.now()-s.mtimeMs <= 900000 ? 0 : 1)\""]
+      test:
+        - CMD-SHELL
+        - >-
+          node src/agent/nasHealth.js
       interval: 30s
       timeout: 5s
       retries: 3

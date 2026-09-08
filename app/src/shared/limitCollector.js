@@ -7,23 +7,33 @@ const os = require('node:os');
 const path = require('node:path');
 const { appVersion } = require('./appVersion');
 const { BROWSER_USER_AGENT } = require('./browserUserAgent');
+const { LIMIT_PROVIDER_IDS } = require('./limitProviders');
 const {
   DEFAULT_LIMITS_REFRESH_MS,
   normalizeLimitProvider,
-  normalizeLimitsSummary
+  normalizeLimitsSummary,
+  openCodeWindowKey
 } = require('./limits');
 const { parseRetryAfterHeader } = require('./limitsRetryPolicy');
 const { abortError } = require('./probeDeadline');
 const cursorAuth = require('./cursorAuth');
 const cursorProbe = require('./cursorProbe');
 const antigravityProbe = require('./antigravityProbe');
+const antigravityOAuth = require('./antigravityOAuth');
 const opencodeLimits = require('./opencodeLimits');
+const opencodeGoApi = require('./opencodeGoApi');
+const opencodeProfiles = require('./opencodeProfiles');
 const opencodeWeb = require('./opencodeWeb');
 const openrouterLimits = require('./openrouterLimits');
 const thirdPartyLimits = require('./thirdPartyLimits');
 const { sharedDataDir } = require('./config');
 const { recordConsumption } = require('./deepseekBalanceHistory');
-const { codexAccountKey, codexAuthIdentity } = require('./codexAuth');
+const {
+  codexAccountKey,
+  codexAuthIdentity,
+  codexOAuthRequestContext,
+  codexStoredAccountId
+} = require('./codexAuth');
 const minimaxLimits = require('./minimaxLimits');
 const { minimaxToken, minimaxBaseUrl, parseMinimaxTiers, fetchMinimaxLimits } = minimaxLimits;
 const mimoLimits = require('./mimoLimits');
@@ -38,13 +48,19 @@ const { zaiToken, zaiRegion, fetchZaiLimits } = zaiLimits;
 const zaiTeamLimits = require('./zaiTeamLimits');
 const { fetchZaiTeamLimits, zaiTeamToken } = zaiTeamLimits;
 const volcengineLimits = require('./volcengineLimits');
+const alibabaLimits = require('./alibabaLimits');
 const { volcengineCredentials, fetchVolcengineLimits } = volcengineLimits;
 const qoderLimits = require('./qoderLimits');
 const { qoderCookie, fetchQoderLimits } = qoderLimits;
+const commandcodeLimits = require('./commandcodeLimits');
+const { commandcodeCookie, fetchCommandcodeLimits } = commandcodeLimits;
 const ollamaLimits = require('./ollamaLimits');
 const { ollamaSessionCookie, fetchOllamaLimits } = ollamaLimits;
 const kimiLimits = require('./kimiLimits');
 const { kimiToken, kimiWebToken, fetchKimiLimits } = kimiLimits;
+const workbuddyLimits = require('./workbuddyLimits');
+const traeLimits = require('./traeLimits');
+const zedLimits = require('./zedLimits');
 const {
   grokCredential,
   readAuthJson,
@@ -55,7 +71,6 @@ const {
   fetchGrokLimits
 } = grokLimits;
 
-const LIMIT_PROVIDER_IDS = ['claude', 'codex', 'opencode', 'cursor', 'antigravity', 'kimi', 'grok', 'copilot', 'mimo', 'zai', 'zaiteam', 'kiro', 'deepseek', 'openrouter', 'minimax', 'volcengine', 'qoder', 'ollama', 'thirdparty'];
 const DEFAULT_PROVIDER_PHYSICAL_BOUND_MS = 120_000;
 const PROVIDER_CLEANUP_GRACE_MS = 5_000;
 const LIMIT_REFRESH_VALUES = new Set([60_000, 120_000, 300_000, 900_000, 1_800_000]);
@@ -77,7 +92,16 @@ const CLAUDE_PREPAID_CACHE_STATE_KEY = 'claude.prepaid-cache';
 const CLAUDE_SESSION_WINDOW_MINUTES = 5 * 60;
 const CLAUDE_WEEKLY_WINDOW_MINUTES = 7 * 24 * 60;
 const CODEX_CHATGPT_BASE_URL = 'https://chatgpt.com/backend-api';
-const CODEX_RESET_CREDITS_PATH = '/wham/rate-limit-reset-credits';
+const CODEX_BACKEND_PATHS = Object.freeze({
+  chatgpt: Object.freeze({
+    usage: '/wham/usage',
+    resetCredits: '/wham/rate-limit-reset-credits'
+  }),
+  codex: Object.freeze({
+    usage: '/api/codex/usage',
+    resetCredits: '/api/codex/rate-limit-reset-credits'
+  })
+});
 const CODEX_EMPTY_QUOTA_RETRY_DELAY_MS = 300;
 const CODEX_RPC_TIMEOUT_MS = 20_000;
 const TOKEN_MONITOR_USER_AGENT = `token-monitor/${appVersion()} (+https://github.com/Javis603/token-monitor)`;
@@ -93,9 +117,9 @@ function parseBoolean(value, fallback = true) {
 }
 
 function parseLimitProviders(value) {
-  const isEmpty = value === undefined || value === null || value === ''
-    || (Array.isArray(value) && value.length === 0);
-  const source = isEmpty ? LIMIT_PROVIDER_IDS : value;
+  // Omission keeps the historical default; an explicitly empty setting means
+  // that no provider is enabled and must survive persistence/reload.
+  const source = value === undefined || value === null ? LIMIT_PROVIDER_IDS : value;
   const raw = Array.isArray(source) ? source : String(source).split(',');
   const seen = new Set();
   const providers = [];
@@ -112,6 +136,13 @@ function normalizeLimitsRefreshMs(value) {
   const parsed = Number(value);
   if (LIMIT_REFRESH_VALUES.has(parsed)) return parsed;
   return DEFAULT_LIMITS_REFRESH_MS;
+}
+
+// A scheduling policy, kept separate from limitsRefreshMs so that switching to
+// adaptive and back restores the interval the user had chosen, and so that no
+// consumer doing arithmetic on limitsRefreshMs has to handle a sentinel value.
+function normalizeLimitsRefreshMode(value) {
+  return String(value ?? '').trim().toLowerCase() === 'adaptive' ? 'adaptive' : 'fixed';
 }
 
 function hashKey(...parts) {
@@ -640,7 +671,7 @@ async function fetchJson(url, headers, deps = {}, options = {}) {
       if (sourceChallenge) error.code = 'CLAUDE_WEB_SOURCE_CHALLENGE';
       throw error;
     }
-    return response.json();
+    return await response.json();
   } catch (error) {
     if (error?.name === 'AbortError') throw errorWithStatus('unavailable', `${url} timed out`);
     throw error;
@@ -1977,9 +2008,45 @@ async function touchClaudeAuthPath(deps = {}) {
 
 function codexWindowKind(name, window) {
   const mins = Number(window?.windowDurationMins || window?.window_duration_mins || 0);
+  // Monthly quotas use the shared wire contract's billing lane. The display
+  // label below keeps the cadence explicit instead of presenting it as money.
+  if (mins === 30 * 24 * 60) return 'billing';
   if (mins >= 7 * 24 * 60) return 'weekly';
+  if (mins >= 24 * 60) return 'daily';
+  if (mins === 5 * 60) return 'session';
   if (String(name).toLowerCase() === 'secondary') return 'weekly';
   return 'session';
+}
+
+function codexAdditionalRateLimitWindows(payload = {}) {
+  const rateLimitsById = codexRateLimitsById(payload);
+  const direct = codexDirectRateLimits(payload);
+  // A named bucket is additive only when a canonical quota source exists. If
+  // an old RPC response has nothing but alternate buckets, codexRateLimitSnapshot
+  // may use their consensus as the main quota; publishing them again here would
+  // duplicate the same numbers as both ordinary and additional windows.
+  if (!Object.hasOwn(rateLimitsById, 'codex') && !hasCodexRateLimitWindows(direct)) return [];
+
+  const windows = [];
+  for (const [limitId, snapshot] of Object.entries(rateLimitsById)) {
+    if (limitId === 'codex' || !snapshot || typeof snapshot !== 'object') continue;
+    const limitName = String(snapshot.limitName ?? snapshot.limit_name ?? '').trim() || String(limitId).trim();
+    if (!limitName) continue;
+    for (const key of ['primary', 'secondary']) {
+      const window = snapshot[key];
+      if (!window) continue;
+      windows.push({
+        kind: codexWindowKind(key, window),
+        label: limitName,
+        limitId,
+        additional: true,
+        usedPercent: window.usedPercent ?? window.used_percent,
+        resetsAt: window.resetsAt ?? window.resets_at,
+        windowMinutes: window.windowDurationMins ?? window.window_duration_mins
+      });
+    }
+  }
+  return windows;
 }
 
 function hasCodexRateLimitWindows(snapshot) {
@@ -1990,8 +2057,66 @@ function codexRateLimitsById(payload = {}) {
   return payload.rateLimitsByLimitId || payload.rate_limits_by_limit_id || {};
 }
 
+function normalizeCodexUsageWindow(window) {
+  if (!window || typeof window !== 'object') return null;
+  const seconds = Number(window.limitWindowSeconds ?? window.limit_window_seconds);
+  return {
+    ...window,
+    usedPercent: window.usedPercent ?? window.used_percent,
+    resetsAt: window.resetsAt ?? window.resetAt ?? window.reset_at,
+    windowDurationMins: Number.isFinite(seconds) ? seconds / 60 : undefined
+  };
+}
+
+function normalizeCodexUsageRateLimit(rateLimit, meta = {}) {
+  const source = rateLimit && typeof rateLimit === 'object' ? rateLimit : {};
+  const primary = normalizeCodexUsageWindow(source.primaryWindow || source.primary_window);
+  const secondary = normalizeCodexUsageWindow(source.secondaryWindow || source.secondary_window);
+  return {
+    ...(primary ? { primary } : {}),
+    ...(secondary ? { secondary } : {}),
+    ...(meta.limitId ? { limitId: meta.limitId } : {}),
+    ...(meta.limitName ? { limitName: meta.limitName } : {}),
+    planType: meta.planType
+  };
+}
+
+function normalizeCodexUsagePayload(payload = {}) {
+  if (!payload || typeof payload !== 'object') return payload;
+  const hasUsageShape = Object.hasOwn(payload, 'rateLimit')
+    || Object.hasOwn(payload, 'rate_limit')
+    || Object.hasOwn(payload, 'additionalRateLimits')
+    || Object.hasOwn(payload, 'additional_rate_limits');
+  if (!hasUsageShape) return payload;
+
+  const planType = payload.planType ?? payload.plan_type;
+  const rateLimit = payload.rateLimit ?? payload.rate_limit;
+  const rateLimits = normalizeCodexUsageRateLimit(rateLimit, { limitId: 'codex', planType });
+  const rateLimitsByLimitId = { ...codexRateLimitsById(payload), codex: rateLimits };
+  const additional = payload.additionalRateLimits ?? payload.additional_rate_limits;
+  for (const entry of Array.isArray(additional) ? additional : []) {
+    if (!entry || typeof entry !== 'object') continue;
+    const limitId = String(entry.meteredFeature ?? entry.metered_feature ?? '').trim();
+    if (!limitId || limitId === 'codex') continue;
+    rateLimitsByLimitId[limitId] = normalizeCodexUsageRateLimit(
+      entry.rateLimit ?? entry.rate_limit,
+      {
+        limitId,
+        limitName: String(entry.limitName ?? entry.limit_name ?? '').trim(),
+        planType
+      }
+    );
+  }
+
+  return { ...payload, rateLimits, rateLimitsByLimitId };
+}
+
 function codexDirectRateLimits(payload = {}) {
-  return payload.rateLimits || payload.rate_limits || {};
+  const direct = payload.rateLimits || payload.rate_limits;
+  if (direct && typeof direct === 'object') return direct;
+  const wham = payload.rateLimit || payload.rate_limit;
+  if (!wham || typeof wham !== 'object') return {};
+  return normalizeCodexUsageRateLimit(wham, { planType: payload.planType ?? payload.plan_type });
 }
 
 function codexRateLimitWindowSignature(snapshot) {
@@ -2049,11 +2174,16 @@ function unambiguousAlternateCodexRateLimits(rateLimitsById) {
 function codexRateLimitSnapshot(payload = {}) {
   const rateLimitsById = codexRateLimitsById(payload);
   const direct = codexDirectRateLimits(payload);
-  if (hasCodexRateLimitWindows(rateLimitsById.codex)) return rateLimitsById.codex;
+  // An explicit main bucket is authoritative even when it has no windows.
+  // OAuth additional_rate_limits are independent metered-feature quotas; they
+  // must never be promoted into the ordinary Codex session/weekly lanes. The
+  // alternate consensus below remains only for legacy RPC payloads that omit
+  // the canonical `codex` key entirely.
+  if (Object.hasOwn(rateLimitsById, 'codex')) return rateLimitsById.codex || {};
   if (hasCodexRateLimitWindows(direct)) return direct;
   const alternate = unambiguousAlternateCodexRateLimits(rateLimitsById);
   if (alternate) return alternate;
-  return rateLimitsById.codex || direct || {};
+  return direct || {};
 }
 
 function codexResetCreditsSnapshot(payload = {}) {
@@ -2070,8 +2200,55 @@ function codexAccessTokenFromAuth(auth) {
   return String(tokens.access_token || auth?.access_token || '').trim();
 }
 
-function codexProviderAccountIdFromAuth(auth) {
-  return codexAuthIdentity(auth).providerAccountId;
+function codexOAuthRequestHeaders(auth, deps = {}, extra = {}) {
+  const context = codexOAuthRequestContext(auth, {
+    accountId: deps.codexAccountId
+  });
+  const headers = {
+    authorization: `Bearer ${context.accessToken}`,
+    accept: 'application/json',
+    'user-agent': TOKEN_MONITOR_USER_AGENT,
+    ...extra
+  };
+  if (context.accountId) headers['chatgpt-account-id'] = context.accountId;
+  if (context.isFedrampAccount) headers['x-openai-fedramp'] = 'true';
+  return headers;
+}
+
+function readCodexOAuthAuth(deps = {}) {
+  const read = deps.readFileSync || fs.readFileSync;
+  const authPath = deps.codexAuthPath || codexAuthPath(deps.env || process.env);
+  let auth;
+  try {
+    auth = JSON.parse(read(authPath, 'utf8'));
+  } catch (_) {
+    throw errorWithStatus('notConfigured', 'Codex auth.json not found');
+  }
+  const accessToken = codexAccessTokenFromAuth(auth);
+  if (!accessToken) throw errorWithStatus('unauthorized', 'Codex access token not found');
+  return { auth, accessToken };
+}
+
+function codexOAuthAuthSnapshot(deps = {}) {
+  return deps.codexOAuthAuthSnapshot || readCodexOAuthAuth(deps);
+}
+
+async function fetchCodexUsage(deps = {}) {
+  const { auth } = codexOAuthAuthSnapshot(deps);
+  const headers = codexOAuthRequestHeaders(auth, deps);
+  try {
+    const baseUrl = codexChatGptBaseUrl(deps);
+    const usagePath = codexBackendPaths(baseUrl).usage;
+    return await fetchJson(
+      `${baseUrl}${usagePath}`,
+      headers,
+      { ...deps, fetchTimeoutMs: deps.codexUsageTimeoutMs || 30_000 },
+      { forbiddenIsUnauthorized: true }
+    );
+  } catch (error) {
+    if (error?.status === 'unauthorized') error.code = 'CODEX_OAUTH_HTTP_UNAUTHORIZED';
+    throw error;
+  }
 }
 
 function parseCodexChatGptBaseUrl(configContents) {
@@ -2092,6 +2269,14 @@ function normalizeCodexChatGptBaseUrl(value) {
     normalized += '/backend-api';
   }
   return normalized;
+}
+
+function codexBackendPathStyle(baseUrl) {
+  return String(baseUrl || '').includes('/backend-api') ? 'chatgpt' : 'codex';
+}
+
+function codexBackendPaths(baseUrl) {
+  return CODEX_BACKEND_PATHS[codexBackendPathStyle(baseUrl)];
 }
 
 function codexChatGptBaseUrl(deps = {}) {
@@ -2129,32 +2314,19 @@ function parseCodexResetCreditsPayload(payload, nowMs = Date.now()) {
 }
 
 async function fetchCodexResetCredits(deps = {}) {
-  const read = deps.readFileSync || fs.readFileSync;
-  const authPath = deps.codexAuthPath || codexAuthPath(deps.env || process.env);
-  let auth;
-  try {
-    auth = JSON.parse(read(authPath, 'utf8'));
-  } catch (_) {
-    throw errorWithStatus('notConfigured', 'Codex auth.json not found');
-  }
-  const accessToken = codexAccessTokenFromAuth(auth);
-  if (!accessToken) throw errorWithStatus('unauthorized', 'Codex access token not found');
+  const { auth } = codexOAuthAuthSnapshot(deps);
 
   const fetchFn = deps.fetch || fetch;
   const timeoutMs = Number(deps.codexResetCreditsTimeoutMs || 4000);
   const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
-  const url = `${codexChatGptBaseUrl(deps)}${CODEX_RESET_CREDITS_PATH}`;
-  const accountId = deps.codexAccountId || codexProviderAccountIdFromAuth(auth);
+  const baseUrl = codexChatGptBaseUrl(deps);
+  const url = `${baseUrl}${codexBackendPaths(baseUrl).resetCredits}`;
   try {
-    const headers = {
-      authorization: `Bearer ${accessToken}`,
-      accept: 'application/json',
-      'user-agent': TOKEN_MONITOR_USER_AGENT,
+    const headers = codexOAuthRequestHeaders(auth, deps, {
       'openai-beta': 'codex-1',
       originator: 'Codex Desktop'
-    };
-    if (accountId) headers['chatgpt-account-id'] = accountId;
+    });
     const response = await fetchFn(url, {
       method: 'GET',
       headers,
@@ -2195,10 +2367,11 @@ async function readCodexResetCredits(deps = {}) {
   return fetchCodexResetCredits(deps);
 }
 
-async function withCodexOAuthResetCredits(payload, deps = {}) {
+async function withCodexOAuthResetCredits(payload, deps = {}, oauthAuthSnapshot = null) {
   const existing = codexResetCreditsSnapshot(payload);
   try {
-    const oauthResetCredits = await readCodexResetCredits(deps);
+    const resetDeps = oauthAuthSnapshot ? { ...deps, codexOAuthAuthSnapshot: oauthAuthSnapshot } : deps;
+    const oauthResetCredits = await readCodexResetCredits(resetDeps);
     return {
       ...payload,
       rateLimitResetCredits: mergeCodexResetCredits(oauthResetCredits, existing)
@@ -2273,17 +2446,22 @@ async function waitForCodexEmptyQuotaRetry(deps = {}) {
 
 function mapCodexRateLimitsToProvider(payload, meta = {}) {
   const rateLimits = codexRateLimitSnapshot(payload);
+  const canonicalLimitId = String(rateLimits.limitId ?? rateLimits.limit_id ?? 'codex').trim() || 'codex';
   const windows = [];
   for (const key of ['primary', 'secondary']) {
     const window = rateLimits[key];
     if (!window) continue;
+    const kind = codexWindowKind(key, window);
     windows.push({
-      kind: codexWindowKind(key, window),
+      kind,
+      ...(kind === 'billing' ? { label: 'Monthly' } : {}),
+      limitId: canonicalLimitId,
       usedPercent: window.usedPercent ?? window.used_percent,
       resetsAt: window.resetsAt ?? window.resets_at,
       windowMinutes: window.windowDurationMins ?? window.window_duration_mins
     });
   }
+  windows.push(...codexAdditionalRateLimitWindows(payload));
   return normalizeLimitProvider({
     provider: 'codex',
     accountKey: meta.accountKey || '',
@@ -2684,6 +2862,7 @@ function createJsonRpcClient(child, timeoutMs) {
   let nextId = 1;
   let buffer = '';
   let closed = false;
+  let transportError = null;
   const pending = new Map();
 
   function rejectAll(error) {
@@ -2694,9 +2873,21 @@ function createJsonRpcClient(child, timeoutMs) {
     pending.clear();
   }
 
-  function abort(error) {
+  function failTransport(error) {
+    if (closed) return;
     closed = true;
+    transportError = error;
     rejectAll(error);
+  }
+
+  function failRetryableTransport(error) {
+    const target = error instanceof Error ? error : new Error(String(error || 'codex app-server transport failed'));
+    target.codexTransportFailure = true;
+    failTransport(target);
+  }
+
+  function abort(error) {
+    failTransport(error);
   }
 
   function handleMessage(message) {
@@ -2718,17 +2909,23 @@ function createJsonRpcClient(child, timeoutMs) {
       try { handleMessage(JSON.parse(line)); } catch (_) {}
     }
   });
-  child.on('error', (error) => {
-    closed = true;
-    rejectAll(error);
-  });
-  child.on('close', (code) => {
-    closed = true;
-    rejectAll(new Error(`codex app-server exited ${code}`));
-  });
+  child.on('error', failRetryableTransport);
+  child.on('close', (code) => failRetryableTransport(new Error(`codex app-server exited ${code}`)));
+  child.stdin.on?.('error', failRetryableTransport);
+
+  function writeLine(line) {
+    if (closed) return;
+    try {
+      child.stdin.write(line, (error) => {
+        if (error) failRetryableTransport(error);
+      });
+    } catch (error) {
+      failRetryableTransport(error);
+    }
+  }
 
   function send(method, params) {
-    if (closed) return Promise.reject(new Error('codex app-server is closed'));
+    if (closed) return Promise.reject(transportError || new Error('codex app-server is closed'));
     const id = nextId++;
     const message = params === undefined ? { method, id } : { method, id, params };
     return new Promise((resolve, reject) => {
@@ -2737,18 +2934,19 @@ function createJsonRpcClient(child, timeoutMs) {
         reject(new Error(`${method} timed out`));
       }, timeoutMs);
       pending.set(id, { resolve, reject, timer });
-      child.stdin.write(`${JSON.stringify(message)}\n`);
+      writeLine(`${JSON.stringify(message)}\n`);
     });
   }
 
   function notify(method, params) {
-    if (!closed) child.stdin.write(`${JSON.stringify(params === undefined ? { method } : { method, params })}\n`);
+    writeLine(`${JSON.stringify(params === undefined ? { method } : { method, params })}\n`);
   }
 
   return { abort, send, notify, rejectAll };
 }
 
 function shouldTryNextCodexCommand(error) {
+  if (error?.codexTransportFailure) return true;
   if (error?.code === 'ENOENT') return true;
   const message = String(error?.message || '').toLowerCase();
   return (
@@ -2791,12 +2989,21 @@ async function readCodexRpcWithCommand(command, deps = {}) {
     });
     rpc.notify('initialized', {});
     let rateLimitResult = await rpc.send('account/rateLimits/read');
-    const accountResult = await rpc.send('account/read').catch(() => {
+    let accountReadError = null;
+    const accountResult = await rpc.send('account/read', { refreshToken: false }).catch((error) => {
       if (signal?.aborted) throw abortError(signal);
+      accountReadError = error;
       return null;
     });
     const account = accountResult?.account || null;
     let payload = codexRpcPayload(rateLimitResult, account, command, deps);
+    if (
+      accountReadError &&
+      !hasCodexRateLimitWindows(codexRateLimitSnapshot(payload)) &&
+      accountReadError.codexTransportFailure
+    ) {
+      throw accountReadError;
+    }
     if (deps.codexEmptyQuotaRetry !== false && shouldRetryCodexEmptyQuotaPayload(payload)) {
       await waitForCodexEmptyQuotaRetry(deps);
       try {
@@ -2808,8 +3015,9 @@ async function readCodexRpcWithCommand(command, deps = {}) {
             rateLimitResetCredits: retryPayload.rateLimitResetCredits || payload.rateLimitResetCredits
           };
         }
-      } catch (_) {
+      } catch (error) {
         if (signal?.aborted) throw abortError(signal);
+        if (error?.codexTransportFailure) throw error;
       }
     }
     if (!account && !hasCodexRateLimitWindows(codexRateLimitSnapshot(payload))) {
@@ -2878,10 +3086,10 @@ function resolvedCodexAccountKey(email, workspaceAccountId, fallbackSeed) {
 function managedCodexAccountKey(account, authIdentity = {}, resolvedEmail = '') {
   const email = String(resolvedEmail || authIdentity.email || account.email || '').trim().toLowerCase();
   const workspaceAccountId = String(
-    authIdentity.workspaceAccountId
-    || authIdentity.providerAccountId
-    || account.workspaceAccountId
+    account.workspaceAccountId
     || account.providerAccountId
+    || authIdentity.workspaceAccountId
+    || authIdentity.providerAccountId
     || ''
   ).trim().toLowerCase();
   return resolvedCodexAccountKey(
@@ -2889,6 +3097,97 @@ function managedCodexAccountKey(account, authIdentity = {}, resolvedEmail = '') 
     workspaceAccountId,
     account.accountKey || authIdentity.accountKey || email || account.id || account.homePath
   );
+}
+
+function codexManagedRpcMatchesSelectedWorkspace(deps = {}, oauthAuthSnapshot = null) {
+  const selectedWorkspaceId = String(deps.codexAccountId || '').trim().toLowerCase();
+  if (!selectedWorkspaceId) return true;
+  const storedWorkspaceId = String(
+    codexStoredAccountId(oauthAuthSnapshot?.auth)
+    || deps.codexRpcStoredAccountId
+    || ''
+  ).trim().toLowerCase();
+  return Boolean(storedWorkspaceId && storedWorkspaceId === selectedWorkspaceId);
+}
+
+function codexOAuthCanFallbackToRpc(error, deps = {}, managedRpcIsScoped = false) {
+  if (
+    (deps.codexAccountId && !managedRpcIsScoped)
+    || deps.signal?.aborted
+    || error?.code === 'ABORT_ERR'
+    || error?.name === 'AbortError'
+  ) return false;
+  const httpStatus = Number(error?.httpStatus);
+  if (Number.isFinite(httpStatus)) return httpStatus === 408 || httpStatus >= 500;
+  return !['notConfigured', 'unauthorized', 'sourceRateLimited'].includes(error?.status);
+}
+
+async function readCodexUsageOrRpc(deps = {}) {
+  const oauthReader = deps.readCodexUsage || fetchCodexUsage;
+  const rpcReader = deps.readCodexRpc || readCodexRpc;
+  let latestOAuthAuthSnapshot = null;
+  const readOAuth = async () => {
+    let oauthAuthSnapshot = null;
+    try {
+      oauthAuthSnapshot = readCodexOAuthAuth(deps);
+    } catch (error) {
+      if (oauthReader === fetchCodexUsage) throw error;
+    }
+    latestOAuthAuthSnapshot = oauthAuthSnapshot;
+    const oauthDeps = oauthAuthSnapshot ? { ...deps, codexOAuthAuthSnapshot: oauthAuthSnapshot } : deps;
+    return {
+      payload: normalizeCodexUsagePayload(await oauthReader(oauthDeps)),
+      source: 'oauth',
+      sourceDetail: '',
+      oauthAuthSnapshot
+    };
+  };
+  let oauthError;
+  let transientRpcFallback;
+  try {
+    return await readOAuth();
+  } catch (error) {
+    oauthError = error;
+    transientRpcFallback = codexOAuthCanFallbackToRpc(
+      error,
+      deps,
+      codexManagedRpcMatchesSelectedWorkspace(deps, latestOAuthAuthSnapshot)
+    );
+    if (!['notConfigured', 'unauthorized'].includes(error?.status) && !transientRpcFallback) {
+      error.codexSource = 'oauth';
+      throw error;
+    }
+  }
+
+  let rpcPayload;
+  try {
+    rpcPayload = await rpcReader(deps);
+  } catch (error) {
+    if (transientRpcFallback) {
+      oauthError.codexSource = 'oauth';
+      throw oauthError;
+    }
+    error.codexSource = 'rpc';
+    throw error;
+  }
+  const managedRpcIsScoped = codexManagedRpcMatchesSelectedWorkspace(
+    deps,
+    latestOAuthAuthSnapshot
+  );
+  // A managed app-server result is usable only when its isolated auth snapshot
+  // is already scoped to the selected workspace. Otherwise RPC remains
+  // recovery-only and the explicitly scoped OAuth request must succeed.
+  if (deps.codexAccountId || oauthError?.code === 'CODEX_OAUTH_HTTP_UNAUTHORIZED') {
+    try {
+      return await readOAuth();
+    } catch (retryError) {
+      if (deps.codexAccountId && !managedRpcIsScoped) {
+        retryError.codexSource = 'oauth';
+        throw retryError;
+      }
+    }
+  }
+  return { payload: rpcPayload, source: 'rpc', sourceDetail: rpcPayload.sourceDetail };
 }
 
 async function fetchManagedCodexAccountLimits(account, _options = {}, deps = {}) {
@@ -2901,33 +3200,41 @@ async function fetchManagedCodexAccountLimits(account, _options = {}, deps = {})
   const accountDeps = {
     ...deps,
     env,
-    codexAuthPath: account.authPath || pathApi.join(account.homePath, 'auth.json')
+    codexAuthPath: account.authPath || pathApi.join(account.homePath, 'auth.json'),
+    codexAccountId: account.workspaceAccountId || undefined
   };
-  const reader = deps.readCodexRpc || readCodexRpc;
-  const authIdentity = readLiveCodexIdentity(accountDeps);
+  const initialAuth = readLiveCodexAuth(accountDeps);
+  const initialAuthIdentity = initialAuth
+    ? codexAuthIdentity(initialAuth)
+    : { email: '', accountLabel: '', providerAccountId: '', accountKey: '' };
+  accountDeps.codexRpcStoredAccountId = codexStoredAccountId(initialAuth);
   try {
-    const payload = await withCodexOAuthResetCredits(await reader(accountDeps), accountDeps);
-    const email = authIdentity.email || payload.account?.email || account.email;
+    const result = await readCodexUsageOrRpc(accountDeps);
+    const payload = await withCodexOAuthResetCredits(result.payload, accountDeps, result.oauthAuthSnapshot);
+    const authIdentity = result.oauthAuthSnapshot
+      ? codexAuthIdentity(result.oauthAuthSnapshot.auth)
+      : initialAuthIdentity;
+    const email = account.email || authIdentity.email || payload.account?.email;
     return mapCodexRateLimitsToProvider(payload, {
       accountKey: managedCodexAccountKey(account, authIdentity, email),
       accountEmail: email,
-      accountLabel: account.accountLabel || codexAccountLabel(payload),
+      accountLabel: codexAccountLabel(payload) || account.accountLabel,
       accountName: account.workspaceLabel,
       workspaceKind: account.workspaceKind,
       updatedAt: nowIso(nowMs),
-      source: 'rpc',
+      source: result.source,
       sourceDetail: 'managed'
     });
   } catch (error) {
-    const email = authIdentity.email || account.email;
+    const email = account.email || initialAuthIdentity.email;
     return normalizeLimitProvider({
       provider: 'codex',
-      accountKey: managedCodexAccountKey(account, authIdentity, email),
+      accountKey: managedCodexAccountKey(account, initialAuthIdentity, email),
       accountEmail: email,
       accountLabel: account.accountLabel,
       accountName: account.workspaceLabel,
       workspaceKind: account.workspaceKind,
-      source: 'rpc',
+      source: error.codexSource || 'oauth',
       sourceDetail: 'managed',
       status: providerStatusFromError(error),
       updatedAt: nowIso(nowMs),
@@ -2940,20 +3247,29 @@ async function fetchManagedCodexAccountLimits(account, _options = {}, deps = {})
 // auth.json. The RPC `account/read` often omits the email, so the JWT in
 // auth.json is the reliable source. The shared composite key keeps the live
 // account consistent with managed accounts for cross-device dedup.
-function readLiveCodexIdentity(deps = {}) {
+function readLiveCodexAuth(deps = {}) {
   const read = deps.readFileSync || fs.readFileSync;
   const authPath = deps.codexAuthPath || codexAuthPath(deps.env || process.env);
   try {
-    return codexAuthIdentity(JSON.parse(read(authPath, 'utf8')));
+    return JSON.parse(read(authPath, 'utf8'));
   } catch (_) {
-    return { email: '', accountLabel: '', providerAccountId: '', accountKey: '' };
+    return null;
   }
 }
 
+function readLiveCodexIdentity(deps = {}) {
+  const auth = readLiveCodexAuth(deps);
+  return auth
+    ? codexAuthIdentity(auth)
+    : { email: '', accountLabel: '', providerAccountId: '', accountKey: '' };
+}
+
 async function fetchLiveCodexAccount(deps = {}, nowMs = Date.now(), managedAccounts = []) {
-  const reader = deps.readCodexRpc || readCodexRpc;
-  const payload = await withCodexOAuthResetCredits(await reader(deps), deps);
-  const authIdentity = readLiveCodexIdentity(deps);
+  const result = await readCodexUsageOrRpc(deps);
+  const payload = await withCodexOAuthResetCredits(result.payload, deps, result.oauthAuthSnapshot);
+  const authIdentity = result.oauthAuthSnapshot
+    ? codexAuthIdentity(result.oauthAuthSnapshot.auth)
+    : readLiveCodexIdentity(deps);
   const email = authIdentity.email || payload.account?.email || '';
   const fallbackSeed = payload.account?.email || `${payload.account?.type || 'account'}:${payload.account?.planType || ''}:${deps.codexAuthPath || codexAuthPath(deps.env || process.env)}`;
   const accountKey = resolvedCodexAccountKey(
@@ -2971,8 +3287,8 @@ async function fetchLiveCodexAccount(deps = {}, nowMs = Date.now(), managedAccou
     accountName: matchingManagedAccount?.workspaceLabel || '',
     workspaceKind: matchingManagedAccount?.workspaceKind || '',
     updatedAt: nowIso(nowMs),
-    source: 'rpc',
-    sourceDetail: payload.sourceDetail
+    source: result.source,
+    sourceDetail: result.sourceDetail
   });
 }
 
@@ -3037,61 +3353,193 @@ async function fetchCodexLimits(options = {}, deps = {}) {
   return providers;
 }
 
-async function fetchAntigravityLimits(_options = {}, deps = {}) {
+function mapAntigravitySnapshot(snapshot, { nowMs, source = 'rpc', account = null } = {}) {
+  const updatedAt = nowIso(nowMs ?? Date.now());
+  const accountEmail = String(snapshot?.accountEmail || account?.accountEmail || '').trim().toLowerCase();
+  const accountLabel = snapshot?.accountPlan ? antigravityPlanLabelFromParts(snapshot.accountPlan) : '';
+  const accountKeySeed = accountEmail || snapshot?.accountPlan || account?.id || 'default';
+  const windows = Array.isArray(snapshot?.windows)
+    ? snapshot.windows.map((window) => ({
+        kind: window.kind,
+        label: window.name,
+        usedPercent: typeof window.remainingFraction === 'number'
+          ? Math.max(0, Math.min(100, (1 - window.remainingFraction) * 100))
+          : null,
+        resetsAt: window.resetTime || null,
+        resetDescription: window.resetDescription || '',
+        windowMinutes: window.kind === 'session' ? 300 : window.kind === 'weekly' ? 10_080 : null,
+        showMeter: window.showMeter !== false
+      }))
+    : (snapshot?.pools || []).map((pool) => ({
+        kind: 'weekly',
+        label: pool.name,
+        usedPercent: Math.max(0, Math.min(100, (1 - pool.remainingFraction) * 100)),
+        resetsAt: pool.resetTime || null,
+        windowMinutes: null
+      }));
+  return normalizeLimitProvider({
+    provider: 'antigravity',
+    accountKey: accountEmail ? antigravityOAuth.accountKey(accountEmail) : hashKey('antigravity', accountKeySeed),
+    accountLabel,
+    accountEmail,
+    source,
+    sourceDetail: snapshot?.sourceDetail || '',
+    // OAuth can identify the account and plan even when Google withholds both
+    // quota payloads. Preserve that identity, but do not present an empty
+    // response as a live zero-usage quota.
+    status: windows.length > 0 ? 'ok' : 'unavailable',
+    updatedAt,
+    windows
+  });
+}
+
+function antigravityAccountError(account, error, nowMs) {
+  const verificationRequired = error?.status === 'verificationRequired';
+  return normalizeLimitProvider({
+    provider: 'antigravity',
+    accountKey: account?.accountKey || antigravityOAuth.accountKey(account?.accountEmail),
+    accountLabel: '',
+    accountEmail: account?.accountEmail || '',
+    source: 'oauth',
+    sourceDetail: 'oauth',
+    status: verificationRequired
+      ? 'unauthorized'
+      : error?.status === 'permissionDenied' ? 'unavailable' : providerStatusFromError(error),
+    ...(verificationRequired ? { actionRequired: 'accountVerification' } : {}),
+    updatedAt: nowIso(nowMs),
+    windows: []
+  });
+}
+
+async function fetchAntigravityLimits(options = {}, deps = {}) {
   const nowMs = (deps.now || Date.now)();
-  const updatedAt = nowIso(nowMs);
   const probeFn = deps.antigravityProbe || antigravityProbe.probe;
-  try {
-    const snapshot = await probeFn(deps);
-    const accountLabel = snapshot.accountPlan ? antigravityPlanLabelFromParts(snapshot.accountPlan) : '';
-    const accountKeySeed = snapshot.accountEmail || snapshot.accountPlan || 'default';
-    const windows = Array.isArray(snapshot.windows)
-      ? snapshot.windows.map((window) => ({
-          kind: window.kind,
-          label: window.name,
-          usedPercent: typeof window.remainingFraction === 'number'
-            ? Math.max(0, Math.min(100, (1 - window.remainingFraction) * 100))
-            : null,
-          resetsAt: window.resetTime || null,
-          resetDescription: window.resetDescription || '',
-          windowMinutes: window.kind === 'session' ? 300 : window.kind === 'weekly' ? 10_080 : null,
-          showMeter: window.showMeter !== false
-        }))
-      : (snapshot.pools || []).map((pool) => ({
-          kind: 'weekly',
-          label: pool.name,
-          usedPercent: Math.max(0, Math.min(100, (1 - pool.remainingFraction) * 100)),
-          resetsAt: pool.resetTime || null,
-          windowMinutes: null
-        }));
-    return normalizeLimitProvider({
-      provider: 'antigravity',
-      accountKey: hashKey('antigravity', accountKeySeed),
-      accountLabel,
-      accountEmail: snapshot.accountEmail || '',
-      source: 'rpc',
-      sourceDetail: snapshot.sourceDetail || '',
-      status: 'ok',
-      updatedAt,
-      windows
-    });
-  } catch (err) {
-    return normalizeLimitProvider({
-      provider: 'antigravity',
-      accountKey: '',
-      accountLabel: '',
-      source: 'rpc',
-      status: providerStatusFromError(err),
-      updatedAt,
-      windows: []
-    });
+  const scope = options.limitRefreshScope?.provider === 'antigravity' ? options.limitRefreshScope : null;
+  const accounts = antigravityOAuth.normalizeManagedAccounts(
+    options.antigravityManagedAccounts || deps.antigravityManagedAccounts,
+    { includeCredentials: true }
+  )
+    .filter((account) => account.enabled !== false)
+    .filter((account) => !scope
+      || (!scope.accountKey || scope.accountKey === account.accountKey)
+      && (!scope.accountEmail || scope.accountEmail === account.accountEmail));
+
+  if (accounts.length === 0 && !scope) {
+    try {
+      return mapAntigravitySnapshot(await probeFn(deps), { nowMs, source: 'rpc' });
+    } catch (error) {
+      return normalizeLimitProvider({
+        provider: 'antigravity',
+        accountKey: '',
+        accountLabel: '',
+        source: 'rpc',
+        status: providerStatusFromError(error),
+        updatedAt: nowIso(nowMs),
+        windows: []
+      });
+    }
   }
+
+  const localPromise = scope?.sourceDetail === 'oauth'
+    ? Promise.resolve(null)
+    : probeFn(deps).then(
+        (snapshot) => mapAntigravitySnapshot(snapshot, { nowMs, source: 'rpc' }),
+        () => null
+      );
+  const remotePromise = Promise.all(accounts.map(async (account) => {
+    try {
+      const snapshot = await antigravityOAuth.fetchRemoteSnapshot(account, {
+        ...deps,
+        collapsePools: antigravityProbe._collapsePools,
+        quotaSummaryWindows: antigravityProbe._quotaSummaryWindows,
+        onCredentialRenewed: (managedAccount, credentials, previous) => (
+          deps.onAntigravityCredentialsRenewed?.({ account: managedAccount, credentials, previous })
+        )
+      });
+      return mapAntigravitySnapshot(snapshot, { nowMs, source: 'oauth', account });
+    } catch (error) {
+      return antigravityAccountError(account, error, nowMs);
+    }
+  }));
+  const [local, remote] = await Promise.all([localPromise, remotePromise]);
+  const providers = [...remote];
+  if (local?.accountKey) {
+    const duplicateIndex = providers.findIndex((provider) => provider.accountKey === local.accountKey);
+    if (duplicateIndex >= 0) providers.splice(duplicateIndex, 1, local);
+    else providers.unshift(local);
+  }
+  return providers;
+}
+
+function openCodeWebIdentity(goWeb, zen, cookie) {
+  const goWorkspaceId = goWeb?.status === 'ok' ? String(goWeb.workspaceId || '') : '';
+  const zenWorkspaceId = zen?.status === 'ok' ? String(zen.workspaceId || '') : '';
+  const workspaceConflict = Boolean(
+    goWorkspaceId && zenWorkspaceId && goWorkspaceId !== zenWorkspaceId
+  );
+  const includeZen = zen?.status === 'ok' && !workspaceConflict;
+  const hasSuccessfulWebProbe = goWeb?.status === 'ok' || includeZen;
+  // Go is the quota authority when two successful probes unexpectedly resolve
+  // different workspaces. Exclude the Zen observation instead of attaching its
+  // balance/windows to the wrong account identity.
+  const workspaceId = goWorkspaceId || (includeZen ? zenWorkspaceId : '');
+  if (hasSuccessfulWebProbe && workspaceId) {
+    return {
+      accountKey: hashKey('opencode', `workspace:${workspaceId}`),
+      aliases: [
+        hashKey('opencode', `go:${workspaceId}`),
+        hashKey('opencode', `zen:${workspaceId}`)
+      ],
+      includeZen
+    };
+  }
+  if (cookie && hasSuccessfulWebProbe) {
+    const cookieHash = crypto.createHash('sha256').update(cookie).digest('hex').slice(0, 12);
+    return { accountKey: hashKey('opencode', `cookie:${cookieHash}`), aliases: [], includeZen };
+  }
+  return { accountKey: '', aliases: [], includeZen };
+}
+
+const OPENCODE_COMPONENT_PROVENANCE_DETAIL = 'managed';
+
+// Statuses that mean "this source failed and the user should see it". Everything
+// else, notably `notConfigured`, is a fall-through: the source simply has nothing
+// for this account, so a later source may still answer.
+const OPENCODE_REMOTE_FAIL_STATUSES = ['unauthorized', 'sourceRateLimited', 'unavailable'];
+
+// Name for the account behind the key OpenCode stores for itself. Parallel to
+// the existing 'default (env)' entry: not a user-chosen name, so it cannot be
+// mistaken for a saved account, and stable so the row keeps its identity.
+// Shown as the account's name until the user gives it one, so it has to survive
+// `normalizeAccountName` intact — the previous "default (auto)" lost its
+// brackets there and reached the card as "default auto". Canonical English on
+// the wire, because a device record is read by devices in other locales; the
+// renderer localizes this exact string.
+const OPENCODE_AMBIENT_ACCOUNT_NAME = 'Auto-detected';
+
+// Supplemental windows fill kinds the Go source did not answer, and are dropped
+// for any kind it did. The comparison is against the windows actually taken
+// rather than against one candidate source: Go quota resolves api → web → local,
+// so naming a single source there leaves the other two unguarded and the account
+// reports one window kind twice, from two sources and with two different numbers.
+function openCodeSupplementalZenWindows(takenWindows, zen) {
+  const takenKeys = new Set(
+    (Array.isArray(takenWindows) ? takenWindows : [])
+      .map(openCodeWindowKey)
+      .filter(Boolean)
+  );
+  return (zen?.windows || []).filter((window) => {
+    const key = openCodeWindowKey(window);
+    return !key || !takenKeys.has(key);
+  });
 }
 
 async function fetchOpenCodeLimits(options = {}, deps = {}) {
   const nowMs = (deps.now || Date.now)();
   const updatedAt = nowIso(nowMs);
   const collectGo = deps.opencodeCollectGo || ((d) => opencodeLimits.collectGo(d));
+  const collectGoApi = deps.opencodeCollectGoApi || ((d) => opencodeGoApi.collectGoApi(d));
+  const readGoApiKey = deps.opencodeReadGoApiKey || ((env) => opencodeGoApi.readGoApiKey(env));
   const fetchGoWeb = deps.opencodeFetchGoWeb || ((cookie, d) => opencodeWeb.fetchGoWeb(cookie, d));
   const fetchZen = deps.opencodeFetchZen || ((cookie, d) => opencodeWeb.fetchZen(cookie, d));
 
@@ -3099,10 +3547,23 @@ async function fetchOpenCodeLimits(options = {}, deps = {}) {
   const explicitProfiles = options.opencodeProfiles;
   const envCookie = (deps.env || process.env).TOKEN_MONITOR_OPENCODE_COOKIE || '';
 
+  // An account is a name, and credentials belong to a name. A profile may hold
+  // any of: a cookie (Go quota plus Zen balance), a stored API key (Go quota),
+  // or a reference to the key OpenCode keeps in auth.json. Sharing a name is
+  // the user's own assertion that they are one account, which is the only thing
+  // that licenses reading quota from one credential while identity and balance
+  // come from another. The reference is stored rather than the key itself, so the
+  // key is re-read every tick; it resolves only while it is still the key the
+  // reference was bound to.
+  const ambientKey = readGoApiKey(deps.env || process.env);
+  const ambientIdentity = ambientKey ? opencodeGoApi.goApiIdentity(ambientKey) : '';
+  const ambientFor = (p) => opencodeProfiles.ambientKeyFor(p, ambientKey, ambientIdentity);
   let cookies = [];
   if (explicitProfiles && Object.keys(explicitProfiles).length > 0) {
     for (const [name, p] of Object.entries(explicitProfiles)) {
-      if (p.enabled && p.cookie) cookies.push({ name, cookie: p.cookie });
+      if (!p.enabled) continue;
+      const apiKey = p.apiKey || ambientFor(p);
+      if (apiKey || p.cookie) cookies.push({ name, apiKey, cookie: p.cookie });
     }
   } else if (options.opencodeCookie) {
     cookies = [{ name: 'default', cookie: options.opencodeCookie }];
@@ -3113,27 +3574,62 @@ async function fetchOpenCodeLimits(options = {}, deps = {}) {
     cookies.push({ name: 'default (env)', cookie: envCookie });
   }
 
+  // The auto-detected key is an unnamed credential until someone names it, so it
+  // is tracked on its own and the zero-config path never disappears. Ownership is
+  // the shared predicate rather than a copy of it here, so the settings panel
+  // cannot end up offering a row this scan is not reading.
+  const ambientClaimed = opencodeProfiles.ambientKeyClaimed(explicitProfiles, ambientKey, ambientIdentity);
+  // Switched off for a machine signed in to an account the user does not want
+  // reported. Only the unclaimed row is suppressed: once an account has claimed
+  // the key it is that account's credential, and the account's own toggle owns
+  // it, exactly as for a cookie.
+  if (ambientKey && !ambientClaimed && options.opencodeAmbientEnabled !== false) {
+    cookies.push({ name: OPENCODE_AMBIENT_ACCOUNT_NAME, apiKey: ambientKey, ambient: true });
+  }
+
   const multiAccountMode = cookies.length > 1;
   const scope = options.limitRefreshScope?.provider === 'opencode'
     ? options.limitRefreshScope
     : null;
   if (scope && multiAccountMode) {
     const profileName = scope.accountName || scope.accountLabel;
+    // Every scope originates from an action on a *stored* account, and the
+    // auto-detected entry is by definition not one. Excluding it by that fact
+    // rather than by its name keeps a user who happens to name an account the
+    // same string from scoping a refresh onto both.
     cookies = profileName
-      ? cookies.filter(({ name }) => name === profileName)
+      ? cookies.filter(({ name, ambient }) => !ambient && name === profileName)
       : [];
   }
 
   // ── Single account (0 or 1 cookie): existing merged behavior ─────────────
   if (!multiAccountMode) {
-    const goLocal = collectGo({ env: deps.env || process.env, now: () => nowMs });
-    const cookie = cookies[0]?.cookie;
-    const [goWeb, zen] = cookie
-      ? await Promise.all([
-          fetchGoWeb(cookie, { now: () => nowMs }),
-          fetchZen(cookie, { now: () => nowMs, workspaceId: '' })
-        ])
-      : [null, null];
+    // The database is device-wide and has no stable account identity, so every
+    // caller must opt in explicitly before this process reads it.
+    const goLocal = options.opencodeLocalLimitsEnabled === true
+      ? collectGo({ env: deps.env || process.env, now: () => nowMs })
+      : { status: 'notConfigured', windows: [] };
+    const primary = cookies[0] || {};
+    const cookie = primary.cookie;
+    // Only this entry's own key, never the ambient one as a stand-in. The
+    // ambient key is its own entry above; reaching for it here would pair it
+    // with a cookie whose account nothing can prove it shares, and the cookie's
+    // workspace identity wins below, so the result would publish one account's
+    // quota — and merge it across devices — under the other's identity.
+    const primaryApiKey = primary.apiKey || '';
+    const [goApi, goWeb, zen] = await Promise.all([
+      collectGoApi({
+        env: deps.env || process.env,
+        now: () => nowMs,
+        fetch: deps.fetch,
+        signal: deps.signal,
+        apiKey: primaryApiKey
+      }),
+      cookie ? fetchGoWeb(cookie, { now: () => nowMs, fetch: deps.fetch }) : null,
+      cookie ? fetchZen(cookie, { now: () => nowMs, workspaceId: '', fetch: deps.fetch }) : null
+    ]);
+    const webIdentity = openCodeWebIdentity(goWeb, zen, cookie);
+    const webAccountKey = webIdentity.accountKey;
 
     const windows = [];
     let status = 'notConfigured';
@@ -3142,42 +3638,109 @@ async function fetchOpenCodeLimits(options = {}, deps = {}) {
     let accountKey = '';
     let balanceUsd = null;
 
-    if (goWeb && goWeb.status === 'ok' && goWeb.windows.length > 0) {
-      windows.push(...goWeb.windows);
+    // Go quota resolves api → web → local. The official API needs no user setup
+    // and is the only source anchored on the real subscription month, so it
+    // outranks the cookie scrape; the local estimate stays last because it sees
+    // only this device's rows and under-reports whenever the same account is
+    // used elsewhere.
+    //
+    // API windows are tagged `web`, not `api`: windows[].source is a two-value
+    // wire enum ('web' | 'local') that hubs rank on, and a hub that predates
+    // this change would strip an unknown value and then rank the window *below*
+    // a local estimate. Both values mean the same thing here anyway — server
+    // truth from opencode.ai — and the finer provenance rides on the
+    // provider-level source below.
+    if (goApi.status === 'ok' && goApi.windows.length > 0) {
+      windows.push(...goApi.windows.map((window) => ({ ...window, source: 'web' })));
+      status = 'ok'; source = 'api'; accountLabel = 'Go';
+      accountKey = hashKey('opencode', goApi.identity || 'go-api');
+    } else if (goWeb && goWeb.status === 'ok' && goWeb.windows.length > 0) {
+      windows.push(...goWeb.windows.map((window) => ({ ...window, source: 'web' })));
       status = 'ok'; source = 'web'; accountLabel = 'Go';
       accountKey = hashKey('opencode', `go:${goWeb.workspaceId || ''}`);
-    } else if (goLocal.status === 'ok') {
-      windows.push(...goLocal.windows);
+    } else if (goLocal.status === 'ok' && goApi.entitled !== false) {
+      // `entitled === false` is the server saying this account has no Go plan,
+      // which the local estimate cannot know: it would keep deriving quota from
+      // rows a cancelled subscription left behind. Only an absent or failed API
+      // answer leaves room for the estimate.
+      windows.push(...goLocal.windows.map((window) => ({ ...window, source: 'local' })));
       status = 'ok'; accountLabel = 'Go';
       accountKey = hashKey('opencode', goLocal.identity || 'go');
-    } else if (goLocal.status === 'unavailable') {
+    } else if (goLocal.status === 'unavailable' && goApi.entitled !== false) {
       status = 'unavailable';
     }
 
-    if (zen && zen.status === 'ok') {
-      windows.push(...zen.windows);
-      status = 'ok'; source = 'web';
+    if (zen && webIdentity.includeZen) {
+      const supplemental = openCodeSupplementalZenWindows(windows, zen)
+        .map((window) => ({ ...window, source: 'web' }));
+      windows.push(...supplemental);
+      status = 'ok';
+      // The provider-level source is the compatibility envelope used by Hubs
+      // that predate windows[].source. It may claim Web only when every quota
+      // window is Web; otherwise an old Hub could turn a local estimate into a
+      // Web observation when it strips component provenance.
+      // 'api' already implies every quota window is server truth, so it keeps
+      // that stronger claim instead of being flattened to 'web' by a Zen window.
+      if (source !== 'api' && !windows.some((window) => window.source === 'local')) source = 'web';
       if (typeof zen.balanceUsd === 'number' && Number.isFinite(zen.balanceUsd)) balanceUsd = zen.balanceUsd;
       if (!accountLabel) accountLabel = 'Zen';
       if (!accountKey) accountKey = hashKey('opencode', `zen:${zen.workspaceId || ''}`);
     } else if (status !== 'ok') {
-      const webFail = ['unauthorized', 'sourceRateLimited', 'unavailable'];
-      const surfaced = (goWeb && webFail.includes(goWeb.status) && goWeb.status)
-        || (zen && webFail.includes(zen.status) && zen.status);
-      if (surfaced) { status = surfaced; source = 'web'; }
+      const remoteFail = OPENCODE_REMOTE_FAIL_STATUSES;
+      // Only reached when nothing produced windows. A stale API key would
+      // otherwise read as "not configured" and leave the user nothing to fix.
+      const surfaced = (remoteFail.includes(goApi.status) && { status: goApi.status, source: 'api' })
+        || (goWeb && remoteFail.includes(goWeb.status) && { status: goWeb.status, source: 'web' })
+        || (zen && remoteFail.includes(zen.status) && { status: zen.status, source: 'web' });
+      if (surfaced) { status = surfaced.status; source = surfaced.source; }
     }
 
-    return normalizeLimitProvider({ provider: 'opencode', accountKey, accountLabel, source, status, updatedAt, windows, balanceUsd });
+    // A failed API probe still names its account: the key identifies it, so a
+    // 401 or a rate limit must not leave an empty accountKey that matches
+    // nothing already stored on the Hub.
+    if (!accountKey && goApi.identity) accountKey = hashKey('opencode', goApi.identity);
+    if (webAccountKey) accountKey = webAccountKey;
+    // Publish the key's own identity as an alias whenever one was used. The
+    // cookie's workspace identity wins above, so without this a device holding
+    // only the key would never group with the account it belongs to.
+    const apiAlias = goApi.identity ? hashKey('opencode', goApi.identity) : '';
+    return normalizeLimitProvider({
+      provider: 'opencode',
+      // The account this row is for, whether or not more than one exists. Left
+      // off, a machine that resolves to exactly one OpenCode account showed it
+      // as "Account 1", and enabling a second account did not fix it until a
+      // restart: the scoped refresh only rebuilds the account it targets, so
+      // this row kept its nameless record while the new one arrived named.
+      accountName: primary.name || '',
+      accountKey,
+      webAccountKey,
+      accountKeyAliases: [...webIdentity.aliases, apiAlias].filter(Boolean),
+      accountLabel,
+      source,
+      sourceDetail: OPENCODE_COMPONENT_PROVENANCE_DETAIL,
+      status,
+      updatedAt,
+      windows,
+      balanceUsd
+    });
   }
 
   // ── Multi-account (2+ cookies): separate per-profile providers ────────────
   const providers = [];
 
-  // Each enabled profile — query in parallel
+  // Each enabled profile — query in parallel. One path for every credential
+  // combination: an account holding only a key is the same shape with no cookie,
+  // and keeping it as a separate function is what let the two drift apart.
   const results = await Promise.all(
-    cookies.map(({ name, cookie }) =>
-      fetchSingleOpenCodeProfile(name, cookie, fetchGoWeb, fetchZen, nowMs, updatedAt)
-    )
+    cookies.map((profile) => fetchOpenCodeProfile(
+      profile.name,
+      profile.cookie,
+      fetchGoWeb,
+      fetchZen,
+      nowMs,
+      updatedAt,
+      { apiKey: profile.apiKey, collectGoApi, deps }
+    ))
   );
   for (const provider of results) {
     if (provider) providers.push(provider);
@@ -3193,18 +3756,32 @@ async function fetchOpenCodeLimits(options = {}, deps = {}) {
   return providers;
 }
 
-async function fetchSingleOpenCodeProfile(name, cookie, fetchGoWeb, fetchZen, nowMs, updatedAt) {
+// One account, whichever credentials it holds. `cookie` and `api.apiKey` are
+// each optional: sharing a name is the user's assertion that they are the same
+// account, which is what licenses reading Go quota from the key while Zen
+// balance and the workspace identity come from the cookie. An account holding
+// only one of them is the same shape with the other absent.
+async function fetchOpenCodeProfile(name, cookie, fetchGoWeb, fetchZen, nowMs, updatedAt, api = {}) {
   const PROFILE_TIMEOUT_MS = 15000;
   let timer;
 
   try {
     const result = await Promise.race([
       (async () => {
-        const [goWeb, zen] = await Promise.all([
-          fetchGoWeb(cookie, { now: () => nowMs }),
-          fetchZen(cookie, { now: () => nowMs, workspaceId: '' })
+        const [goWeb, zen, goApi] = await Promise.all([
+          cookie ? fetchGoWeb(cookie, { now: () => nowMs, fetch: api.deps?.fetch }) : null,
+          cookie ? fetchZen(cookie, { now: () => nowMs, workspaceId: '', fetch: api.deps?.fetch }) : null,
+          api.apiKey
+            ? api.collectGoApi({
+              env: api.deps?.env || process.env,
+              now: () => nowMs,
+              fetch: api.deps?.fetch,
+              signal: api.deps?.signal,
+              apiKey: api.apiKey
+            })
+            : null
         ]);
-        return { goWeb, zen };
+        return { goWeb, zen, goApi };
       })(),
       new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error('timeout')), PROFILE_TIMEOUT_MS);
@@ -3212,65 +3789,121 @@ async function fetchSingleOpenCodeProfile(name, cookie, fetchGoWeb, fetchZen, no
     ]);
     clearTimeout(timer);
 
-    const { goWeb, zen } = result;
+    const { goWeb, zen, goApi } = result;
     const windows = [];
     let status = 'notConfigured';
     let planLabel = '';
     let balanceUsd = null;
+    let source = 'web';
 
-    if (goWeb && goWeb.status === 'ok' && goWeb.windows.length > 0) {
-      windows.push(...goWeb.windows);
+    if (goApi && goApi.status === 'ok' && goApi.windows.length > 0) {
+      windows.push(...goApi.windows.map((window) => ({ ...window, source: 'web' })));
+      status = 'ok';
+      planLabel = 'Go';
+      source = 'api';
+    } else if (goWeb && goWeb.status === 'ok' && goWeb.windows.length > 0) {
+      windows.push(...goWeb.windows.map((window) => ({ ...window, source: 'web' })));
       status = 'ok';
       planLabel = 'Go';
     }
 
-    if (zen && zen.status === 'ok') {
-      windows.push(...zen.windows);
+    const webIdentity = openCodeWebIdentity(goWeb, zen, cookie);
+    if (zen && webIdentity.includeZen) {
+      const supplemental = openCodeSupplementalZenWindows(windows, zen)
+        .map((window) => ({ ...window, source: 'web' }));
+      windows.push(...supplemental);
       status = 'ok';
       if (!planLabel) planLabel = 'Zen';
       if (typeof zen.balanceUsd === 'number' && Number.isFinite(zen.balanceUsd)) balanceUsd = zen.balanceUsd;
     }
 
     if (status !== 'ok') {
-      const failStatus = goWeb?.status || zen?.status || 'unauthorized';
-      status = failStatus;
+      // `notConfigured` from the API means "this account has no Go subscription",
+      // which is a fallback condition rather than a failure. Letting it win here
+      // would hide the cookie's own `unauthorized` and tell the user nothing is
+      // configured when what actually happened is that their cookie expired.
+      // The API's own `notConfigured` is ranked last rather than dropped: it
+      // must not outrank an expired cookie, but on an account with no cookie at
+      // all it is the true answer, and falling through to the literal would
+      // report "sign in again" for a workspace that simply has no Go plan.
+      //
+      // Provenance travels with the status, as it does on the single-account
+      // path and in the timeout branch below. Left behind, the `web` default
+      // stood while the status came from the key, so one expired API key read
+      // as an `API` failure on a machine with a single account and as a `Web`
+      // failure the moment a second account existed. How many accounts are
+      // configured cannot change which credential failed.
+      const failure = (OPENCODE_REMOTE_FAIL_STATUSES.includes(goApi?.status) && { status: goApi.status, source: 'api' })
+        || (goWeb && { status: goWeb.status, source: 'web' })
+        || (zen && { status: zen.status, source: 'web' })
+        || (goApi && { status: goApi.status, source: 'api' })
+        || { status: 'unauthorized', source: api.apiKey && !cookie ? 'api' : 'web' };
+      status = failure.status;
+      source = failure.source;
     }
 
-    // Stable accountKey derived from workspaceId (preferred) or cookie hash,
-    // not from the user-editable profile name — so the same account is
-    // consistently identified across machines and renames.
-    const goWid = goWeb?.workspaceId || '';
-    const zenWid = zen?.workspaceId || '';
-    let accountKey;
-    if (goWeb && goWeb.status === 'ok' && goWid) {
-      accountKey = hashKey('opencode', `go:${goWid}`);
-    } else if (zen && zen.status === 'ok' && zenWid) {
-      accountKey = hashKey('opencode', `zen:${zenWid}`);
-    } else {
+    // The key's own identity, published whenever this account holds one. The
+    // same key on another device that has no cookie identifies itself by that
+    // key alone, so without this the two devices never group into one account.
+    const keyIdentity = api.apiKey
+      ? hashKey('opencode', opencodeGoApi.goApiIdentity(api.apiKey))
+      : '';
+
+    // Stable accountKey derived from workspaceId (preferred), then the key, then
+    // the cookie hash — never from the user-editable profile name, so the same
+    // account is identified consistently across machines and renames. The key
+    // ranks above the cookie hash because it is the same string on every device,
+    // while a cookie is per-browser-session.
+    let accountKey = webIdentity.accountKey || keyIdentity;
+    if (!accountKey && cookie) {
       const cookieHash = crypto.createHash('sha256').update(cookie).digest('hex').slice(0, 12);
       accountKey = hashKey('opencode', `cookie:${cookieHash}`);
     }
+    const boundKeyAlias = accountKey === keyIdentity ? '' : keyIdentity;
 
     return normalizeLimitProvider({
       provider: 'opencode',
       accountKey,
+      // Only a cookie yields this. The Hub picks the canonical identity for a
+      // merged account from the webAccountKeys it collects, and it picks by
+      // sorting them, so publishing the key's hash here would let an API-only
+      // device's identity win over a real workspace id — deciding an account's
+      // canonical identity by which devices happen to be online.
+      webAccountKey: webIdentity.accountKey,
+      accountKeyAliases: [...webIdentity.aliases, boundKeyAlias].filter(Boolean),
       accountName: name,
       // Keep accountLabel as the profile name for pre-accountName renderers.
       // New renderers use planLabel for Go/Zen and accountName for identity.
       accountLabel: name,
       planLabel,
-      source: 'web',
+      source,
+      sourceDetail: OPENCODE_COMPONENT_PROVENANCE_DETAIL,
       status,
       updatedAt,
       windows,
       balanceUsd
     });
-  } catch {
+  } catch (error) {
     clearTimeout(timer);
-    const cookieHash = crypto.createHash('sha256').update(cookie).digest('hex').slice(0, 12);
+    // Routing the API probe through this helper made it reachable by an abort,
+    // which the bare catch would have turned into a stale `unavailable` row and
+    // published over whatever superseded it. The lane is latest-wins.
+    if (opencodeGoApi.isAbortError(error, api.deps?.signal)) throw error;
+    // Same identity ranking as the success path, so a timeout does not hand the
+    // account a different accountKey than the one already on the Hub.
+    let accountKey = api.apiKey ? hashKey('opencode', opencodeGoApi.goApiIdentity(api.apiKey)) : '';
+    if (!accountKey && cookie) {
+      const cookieHash = crypto.createHash('sha256').update(cookie).digest('hex').slice(0, 12);
+      accountKey = hashKey('opencode', `cookie:${cookieHash}`);
+    }
     return normalizeLimitProvider({
-      provider: 'opencode', accountKey: hashKey('opencode', `cookie:${cookieHash}`),
-      accountName: name, accountLabel: name, planLabel: '', source: 'web', status: 'unavailable',
+      // No webAccountKey: this row probed nothing, so it has no workspace
+      // identity to offer, and claiming one would let a timed-out device decide
+      // the canonical identity of the merged account.
+      provider: 'opencode', accountKey,
+      accountName: name, accountLabel: name, planLabel: '',
+      source: api.apiKey && !cookie ? 'api' : 'web',
+      sourceDetail: OPENCODE_COMPONENT_PROVENANCE_DETAIL, status: 'unavailable',
       updatedAt, windows: [], balanceUsd: null
     });
   }
@@ -3403,9 +4036,14 @@ function providerFetchers(deps = {}) {
     zai: (providerOptions, probeDeps) => zaiLimits.fetchZaiLimits(providerOptions, probeDeps),
     zaiteam: (providerOptions, probeDeps) => zaiTeamLimits.fetchZaiTeamLimits(providerOptions, probeDeps),
     volcengine: (providerOptions, probeDeps) => volcengineLimits.fetchVolcengineLimits(providerOptions, probeDeps),
+    alibaba: (providerOptions, probeDeps) => alibabaLimits.fetchAlibabaLimits(providerOptions, probeDeps),
+    commandcode: (providerOptions, probeDeps) => commandcodeLimits.fetchCommandcodeLimits(providerOptions, probeDeps),
     qoder: (providerOptions, probeDeps) => qoderLimits.fetchQoderLimits(providerOptions, probeDeps),
+    trae: (providerOptions, probeDeps) => traeLimits.fetchTraeLimits(providerOptions, probeDeps),
+    workbuddy: (providerOptions, probeDeps) => workbuddyLimits.fetchWorkbuddyLimits(providerOptions, probeDeps),
     ollama: (providerOptions, probeDeps) => ollamaLimits.fetchOllamaLimits(providerOptions, probeDeps),
     kimi: (providerOptions, probeDeps) => kimiLimits.fetchKimiLimits(providerOptions, probeDeps),
+    zed: (providerOptions, probeDeps) => zedLimits.fetchZedLimits(providerOptions, probeDeps),
     thirdparty: (providerOptions, probeDeps) => thirdPartyLimits.fetchThirdPartyLimits(providerOptions, probeDeps),
     ...(deps.providerFetchers || {})
   };
@@ -3462,6 +4100,7 @@ function createProbeFetch(fetchFn, context = {}, deps = {}) {
 
 function resolveProviderFetch(provider, deps = {}) {
   if (typeof deps.fetch === 'function') return deps.fetch;
+  if (provider === 'workbuddy' && typeof deps.workbuddyFetch === 'function') return deps.workbuddyFetch;
   if (provider === 'grok') return grokLimits.resolveGrokFetch(deps);
   return fetch;
 }
@@ -3530,9 +4169,13 @@ function createLimitsCollector(options = {}, deps = {}) {
   };
 }
 
-function hashCursorAccountKey(account) {
-  const seed = account.userId || account.id || 'cursor';
-  return hashKey('cursor', seed);
+function hashCursorAccountKey(account, resolvedUserId = '') {
+  const accountId = String(account?.id || '').trim();
+  const canonicalUserId = [resolvedUserId, account?.userId, accountId]
+    .map(cursorAuth.canonicalCursorUserId)
+    .find(Boolean) || '';
+  if (canonicalUserId) return hashKey('cursor', canonicalUserId);
+  return hashKey('cursor-local', accountId || 'unknown');
 }
 
 function formatCursorMembership(type) {
@@ -3568,13 +4211,50 @@ function cursorBillingWindow(label, fields = {}) {
   };
 }
 
-async function fetchCursorLimits(_options = {}, deps = {}) {
+function cursorOnDemandWindow(usage, resetsAt) {
+  const personalUsed = finiteNumber(usage.onDemandUsedUsd) ?? 0;
+  const personalLimit = finiteNumber(usage.onDemandLimitUsd);
+  const teamUsed = finiteNumber(usage.teamOnDemandUsedUsd) ?? 0;
+  const teamLimit = finiteNumber(usage.teamOnDemandLimitUsd);
+  let used;
+  let limit = null;
+  let remaining = null;
+
+  if (personalLimit !== null && personalLimit > 0) {
+    used = personalUsed;
+    limit = personalLimit;
+    remaining = finiteNumber(usage.onDemandRemainingUsd);
+  } else if (teamLimit !== null && teamLimit > 0) {
+    used = teamUsed;
+    limit = teamLimit;
+    remaining = finiteNumber(usage.teamOnDemandRemainingUsd);
+  } else if (personalUsed > 0) {
+    used = personalUsed;
+  } else if (teamUsed > 0) {
+    used = teamUsed;
+  } else {
+    return null;
+  }
+
+  if (limit !== null && remaining === null) remaining = Math.max(0, limit - used);
+  return cursorBillingWindow('On-demand spend', {
+    metric: 'spend',
+    currency: 'USD',
+    usedPercent: percentFromUsedLimit(used, limit),
+    used,
+    limit,
+    remaining,
+    resetsAt,
+    windowMinutes: null,
+    resetDescription: '',
+    showMeter: false
+  });
+}
+
+async function fetchCursorAccountLimits(account, deps = {}) {
   const nowMs = (deps.now || Date.now)();
   const updatedAt = new Date(nowMs).toISOString();
-  const readActiveAccount = deps.readActiveAccount || cursorAuth.readActiveAccount;
   const probe = deps.probe || cursorProbe.probe;
-
-  const account = readActiveAccount();
   if (!account) {
     return {
       provider: 'cursor',
@@ -3606,71 +4286,50 @@ async function fetchCursorLimits(_options = {}, deps = {}) {
   const hasRequestUsage = finiteNumber(usage.requestsUsed) !== null
     && finiteNumber(usage.requestsLimit) !== null
     && usage.requestsLimit > 0;
-  const totalPercent = hasRequestUsage
-    ? percentFromUsedLimit(usage.requestsUsed, usage.requestsLimit)
-    : usage.planPercent;
-  const windows = [
-    cursorBillingWindow('Total', {
-      usedPercent: totalPercent,
-      used: hasRequestUsage ? usage.requestsUsed : usage.planUsedUsd,
-      limit: hasRequestUsage ? usage.requestsLimit : usage.planLimitUsd,
-      remaining: hasRequestUsage
-        ? Math.max(0, usage.requestsLimit - usage.requestsUsed)
-        : usage.planRemainingUsd,
+  const windows = [];
+
+  if (hasRequestUsage) {
+    windows.push(cursorBillingWindow('Requests', {
+      usedPercent: percentFromUsedLimit(usage.requestsUsed, usage.requestsLimit),
+      used: usage.requestsUsed,
+      limit: usage.requestsLimit,
+      remaining: Math.max(0, usage.requestsLimit - usage.requestsUsed),
       resetsAt,
       windowMinutes: null,
       resetDescription: usage.membershipType ? `Cursor ${usage.membershipType}` : ''
-    })
-  ];
-
-  if (finiteNumber(usage.autoPercent) !== null) {
-    windows.push(cursorBillingWindow('Auto', {
+    }));
+  } else if (finiteNumber(usage.autoPercent) !== null || finiteNumber(usage.apiPercent) !== null) {
+    if (finiteNumber(usage.autoPercent) !== null) windows.push(cursorBillingWindow('Cursor Models', {
       usedPercent: usage.autoPercent,
       resetsAt,
       windowMinutes: null
     }));
-  }
-
-  if (finiteNumber(usage.apiPercent) !== null) {
-    windows.push(cursorBillingWindow('API', {
+    if (finiteNumber(usage.apiPercent) !== null) windows.push(cursorBillingWindow('Other Models', {
       usedPercent: usage.apiPercent,
+      resetsAt,
+      windowMinutes: null
+    }));
+  } else if (usage.hasOverallUsage && finiteNumber(usage.planPercent) !== null) {
+    windows.push(cursorBillingWindow('Overall', {
+      usedPercent: usage.planPercent,
+      used: usage.planUsedUsd,
+      limit: usage.planLimitUsd,
+      remaining: usage.planRemainingUsd,
       resetsAt,
       windowMinutes: null
     }));
   }
 
-  if (usage.hasOnDemandUsage || finiteNumber(usage.onDemandLimitUsd) !== null || (finiteNumber(usage.onDemandUsedUsd) !== null && usage.onDemandUsedUsd > 0)) {
-    const remaining = finiteNumber(usage.onDemandRemainingUsd)
-      ?? (finiteNumber(usage.onDemandLimitUsd) !== null
-        ? Math.max(0, usage.onDemandLimitUsd - (finiteNumber(usage.onDemandUsedUsd) || 0))
-        : null);
-    windows.push(cursorBillingWindow('Credits', {
-      usedPercent: finiteNumber(usage.onDemandPercent) ?? percentFromUsedLimit(usage.onDemandUsedUsd, usage.onDemandLimitUsd),
-      used: usage.onDemandUsedUsd,
-      limit: usage.onDemandLimitUsd,
-      remaining,
-      resetsAt: null,
-      windowMinutes: null,
+  if (usage.grokBot?.hasNonZeroIncludedLimit === true && finiteNumber(usage.grokBot.usedPercent) !== null) {
+    windows.push({
+      kind: 'weekly',
+      label: 'Grok Bot',
+      usedPercent: usage.grokBot.usedPercent,
+      resetsAt: usage.grokBot.resetsAt || null,
+      windowMinutes: finiteNumber(usage.grokBot.windowMinutes),
       resetDescription: '',
-      showMeter: false
-    }));
-  }
-
-  if (usage.hasTeamOnDemandUsage || finiteNumber(usage.teamOnDemandLimitUsd) !== null || (finiteNumber(usage.teamOnDemandUsedUsd) !== null && usage.teamOnDemandUsedUsd > 0)) {
-    const remaining = finiteNumber(usage.teamOnDemandRemainingUsd)
-      ?? (finiteNumber(usage.teamOnDemandLimitUsd) !== null
-        ? Math.max(0, usage.teamOnDemandLimitUsd - (finiteNumber(usage.teamOnDemandUsedUsd) || 0))
-        : null);
-    windows.push(cursorBillingWindow('Team credits', {
-      usedPercent: finiteNumber(usage.teamOnDemandPercent) ?? percentFromUsedLimit(usage.teamOnDemandUsedUsd, usage.teamOnDemandLimitUsd),
-      used: usage.teamOnDemandUsedUsd,
-      limit: usage.teamOnDemandLimitUsd,
-      remaining,
-      resetsAt: null,
-      windowMinutes: null,
-      resetDescription: '',
-      showMeter: false
-    }));
+      showMeter: true
+    });
   }
 
   if (usage.hasTeamPooledUsage || finiteNumber(usage.teamPooledLimitUsd) !== null || (finiteNumber(usage.teamPooledUsedUsd) !== null && usage.teamPooledUsedUsd > 0)) {
@@ -3689,10 +4348,15 @@ async function fetchCursorLimits(_options = {}, deps = {}) {
     }));
   }
 
+  const onDemandWindow = cursorOnDemandWindow(usage, resetsAt);
+  if (onDemandWindow) windows.push(onDemandWindow);
+
   return {
     provider: 'cursor',
-    accountKey: hashCursorAccountKey(account),
-    accountLabel: formatCursorMembership(usage.membershipType) || account.label || '',
+    accountKey: hashCursorAccountKey(account, result.user?.sub),
+    accountLabel: result.user?.email || account.label || formatCursorMembership(usage.membershipType) || '',
+    accountEmail: result.user?.email || '',
+    planLabel: formatCursorMembership(usage.membershipType),
     status: 'ok',
     source: 'web',
     updatedAt,
@@ -3700,7 +4364,29 @@ async function fetchCursorLimits(_options = {}, deps = {}) {
   };
 }
 
+async function fetchCursorLimits(options = {}, deps = {}) {
+  let accounts;
+  if (typeof deps.listAccounts === 'function') {
+    accounts = deps.listAccounts();
+  } else if (typeof deps.readActiveAccount === 'function') {
+    accounts = [deps.readActiveAccount()].filter(Boolean);
+  } else {
+    accounts = cursorAuth.listAccounts();
+  }
+  if (!Array.isArray(accounts) || accounts.length === 0) {
+    return fetchCursorAccountLimits(null, deps);
+  }
+  const disabled = new Set((Array.isArray(options.cursorDisabledAccountIds) ? options.cursorDisabledAccountIds : [])
+    .map((id) => String(id || '').trim())
+    .filter(Boolean));
+  const enabledAccounts = accounts.filter((account) => !disabled.has(account.id));
+  if (enabledAccounts.length === 0) return fetchCursorAccountLimits(null, deps);
+  const providers = await Promise.all(enabledAccounts.map((account) => fetchCursorAccountLimits(account, deps)));
+  return providers.length === 1 ? providers[0] : providers;
+}
+
 module.exports = {
+  LIMIT_PROVIDER_IDS,
   DEFAULT_PROVIDER_PHYSICAL_BOUND_MS,
   PROVIDER_CLEANUP_GRACE_MS,
   collectLimitsOnce,
@@ -3716,7 +4402,7 @@ module.exports = {
   fetchOpenCodeLimits,
   fetchOpenRouterLimits: openrouterLimits.fetchOpenRouterLimits,
   fetchThirdPartyLimits: thirdPartyLimits.fetchThirdPartyLimits,
-  fetchSingleOpenCodeProfile,
+  fetchOpenCodeProfile,
   claudeWebCookie,
   normalizeClaudeWebCookieInput,
   fetchClaudeLimits,
@@ -3751,19 +4437,34 @@ module.exports = {
   fetchZaiTeamLimits,
   volcengineCredentials,
   fetchVolcengineLimits,
+  alibabaCookie: alibabaLimits.alibabaCookie,
+  alibabaVariant: alibabaLimits.alibabaVariant,
+  alibabaDashboardUrl: alibabaLimits.alibabaDashboardUrl,
+  normalizeAlibabaCookieHeader: alibabaLimits.normalizeAlibabaCookieHeader,
+  fetchAlibabaLimits: alibabaLimits.fetchAlibabaLimits,
   qoderCookie,
   fetchQoderLimits,
+  traeAccessToken: traeLimits.traeAccessToken,
+  traeDeviceId: traeLimits.traeDeviceId,
+  fetchTraeLimits: traeLimits.fetchTraeLimits,
+  fetchWorkbuddyLimits: workbuddyLimits.fetchWorkbuddyLimits,
+  commandcodeCookie,
+  fetchCommandcodeLimits,
   ollamaSessionCookie,
   fetchOllamaLimits,
   kimiToken,
   kimiWebToken,
   fetchKimiLimits,
+  zedCookie: zedLimits.zedCookie,
+  normalizeZedCookieHeader: zedLimits.normalizeZedCookieHeader,
+  fetchZedLimits: zedLimits.fetchZedLimits,
   mapClaudeCliUsageToProvider,
   mapClaudeUsageToProvider,
   mapCodexRateLimitsToProvider,
   parseClaudeCliUsageText,
   parseBoolean,
   parseLimitProviders,
+  normalizeLimitsRefreshMode,
   normalizeLimitsRefreshMs,
   refreshClaudeAccessToken,
   refreshClaudeCredentials,
