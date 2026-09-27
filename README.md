@@ -10,7 +10,7 @@ image: ghcr.io/gott-mit-uns/token-monitor-hermes:latest
 
 支持 `linux/amd64`（DXP4800）和 `linux/arm64`（DH4300plus）。`latest` 仅在发布前安全检查、构建及两种架构的 Agent 测试成功后更新。固定版本为 `0.54.0-nas.2`，每次构建还保留 `sha-<完整提交 SHA>` 标签。
 
-仓库当前仍为私有，新建镜像按 GHCR 默认规则为私有；请在 GitHub 的 Packages 设置核对镜像可见性。NAS 拉取私有镜像需要预先安全配置只读包访问授权。将源码仓库改为公开不会自动把已有镜像改为公开；镜像可见性需要单独设置为公开，才能免登录拉取。不要把拉取凭据写入 Compose 或提交到 Git。
+源码仓库和 `token-monitor-hermes` GHCR 镜像包现已公开，NAS 无需 GitHub 登录即可拉取 `latest`。已验证匿名访问镜像清单成功，支持 amd64 和 arm64。源码公开与镜像包公开是独立设置；以后新建其他镜像包时仍需单独核对可见性。不要提交 NAS 本地配置、凭据或运行数据。
 
 在原 Compose 所在目录运行：
 
