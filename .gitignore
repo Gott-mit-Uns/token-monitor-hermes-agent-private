@@ -20,3 +20,8 @@ app/tests/docs/
 app/tests/electron/
 app/tests/hub/
 app/tests/worker/
+
+*.log
+*.jsonl
+*.zip
+coverage/

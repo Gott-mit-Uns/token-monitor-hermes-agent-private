@@ -1,7 +1,27 @@
-# Security notes
+# 发布与数据安全
 
-- Keep this repository and its linked GHCR package private.
-- Do not commit `.env`, Hub secrets, GitHub tokens, Hermes databases, Agent state, logs, or usage exports.
-- Use a dedicated read-only package credential on the NAS.
-- Rotate a credential immediately if it appears in Git history, workflow logs, or Compose output.
-- Review dependency and base-image updates before rebuilding the NAS image.
+## 当前可见性
+
+仓库保持私有。GHCR 新建包默认私有，发布后应核对包设置；是否公开源码和镜像，由仓库所有者分别决定。公开源码不等于公开已有 GHCR 镜像。
+
+## 数据边界
+
+- GitHub 构建只读取仓库，不连接 NAS 或桌面 Hub，不使用生产 `.env`，不读取生产 Hermes 数据库。
+- 最终镜像只包含源码和依赖，不包含宿主机数据或运行状态。
+- NAS 上的 Agent 正常运行会把用量统计发给配置的 Hub；这不是上传到 GitHub。
+- 不要提交 `.env`、Hub 共享密钥、GitHub 凭据、数据库、Agent 状态、日志、用量导出或备份。
+- NAS 拉取私有镜像时使用只读包授权，凭据保存在 NAS 的登录配置中，不写入 Compose。
+
+## 检查与限制
+
+`scripts/check-publication-safety.py` 扫描可达 Git 历史中的运行数据文件和常见密钥格式，仅输出路径与问题类型。模式扫描不是完整的秘密审计：自定义口令、已删除分支、外部构建日志、GitHub Secrets 和未跟踪的 NAS 文件不在这个证明范围内。
+
+2026-09-27 初始检查：7 个提交、340 个历史文件版本，未发现跟踪的运行数据文件或常见格式真实密钥。历史记录包含 NAS 型号、挂载路径和部署验证说明；公开后这些历史说明也会可见。删除当前文档不会删除旧 Git 历史。
+
+公开前应人工审查历史、测试样例、包文件与文档；将仓库和 GHCR 包分别改为公开后，再验证匿名拉取。不要因构建发布成功而假定包已公开。
+
+若真实凭据曾进入 Git、工作流日志或命令输出，应立即撤销或轮换，并处理历史中的泄露内容。
+
+## 更新
+
+审阅依赖和基础镜像变更后再发布。`latest` 只有在安全检查、构建和 amd64/arm64 Agent 测试通过后更新。设备 ID 变化保留旧 Hub 记录，不启用自动删除。

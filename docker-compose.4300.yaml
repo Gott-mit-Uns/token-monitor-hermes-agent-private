@@ -1,9 +1,6 @@
 services:
   token-monitor-hermes-agent:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: token-monitor-hermes-agent:0.54.0-nas.1
+    image: ghcr.io/gott-mit-uns/token-monitor-hermes:latest
     container_name: token-monitor-hermes-agent
     restart: unless-stopped
     init: true
@@ -16,6 +13,8 @@ services:
       HERMES_HOME: /hermes
       HOME: /config
       XDG_CONFIG_HOME: /config
+      # Hub uses this ID as the display name. Edit it, then recreate the container.
+      # A changed ID creates a new Hub record; the previous record is retained.
       TOKEN_MONITOR_DEVICE_ID: Hermes-NAS-4300
       TOKEN_MONITOR_CLIENTS: hermes
       TOKEN_MONITOR_INTERVAL_MS: "300000"
