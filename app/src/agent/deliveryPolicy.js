@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { sharedDataDir } = require('../shared/config');
 
-const TRANSIENT_RECORD_KEYS = new Set(['observedAt', 'receivedAt', 'updatedAt']);
+const TRANSIENT_RECORD_KEYS = new Set(['observedAt', 'receivedAt', 'updatedAt', 'lastAttemptAt', 'lastSuccessAt']);
 
 function stableSemanticJson(value) {
   if (Array.isArray(value)) return `[${value.map(stableSemanticJson).join(',')}]`;

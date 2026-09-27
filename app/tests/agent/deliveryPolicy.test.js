@@ -81,3 +81,11 @@ test('deduplication retains date boundaries and session detail changes', () => {
   assert.notEqual(semanticRecordFingerprint(first), semanticRecordFingerprint(nextDay));
   assert.notEqual(semanticRecordFingerprint(first), semanticRecordFingerprint(nextSession));
 });
+
+test('collection health clocks do not defeat deduplication while failures remain visible', () => {
+  const first = {...record(10), clientHealth:{clients:{hermes:{collection:{state:'ok', lastAttemptAt:'a', lastSuccessAt:'a'}}}}};
+  const repeated = {...first, clientHealth:{clients:{hermes:{collection:{state:'ok', lastAttemptAt:'b', lastSuccessAt:'b'}}}}};
+  const failed = {...first, clientHealth:{clients:{hermes:{collection:{state:'failed', lastAttemptAt:'b', lastSuccessAt:'a'}}}}};
+  assert.equal(semanticRecordFingerprint(first), semanticRecordFingerprint(repeated));
+  assert.notEqual(semanticRecordFingerprint(first), semanticRecordFingerprint(failed));
+});
