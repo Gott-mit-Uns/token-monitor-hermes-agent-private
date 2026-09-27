@@ -20,11 +20,11 @@ jobs:
           fetch-depth: 0
       - name: Check publication safety
         run: python3 scripts/check-publication-safety.py
-      - name: Read NAS version
+      - name: Read release version
         id: version
         run: |
-          version=$(cat nas-version.txt)
-          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-nas\.[0-9]+$ ]]
+          version=$(node -p "require('./app/package.json').version")
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           echo "value=$version" >> "$GITHUB_OUTPUT"
       - name: Build and test without NAS data
         run: |
