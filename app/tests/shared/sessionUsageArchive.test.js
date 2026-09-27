@@ -421,14 +421,31 @@ test('reapplies a large session archive without repeatedly normalizing growing p
     };
   }
 
-  const startedAt = performance.now();
-  const visible = applySessionUsageArchive({ allTime: { sessions: {} } }, archive, {
+  // Count normalized session visits rather than wall time: QEMU and slower
+  // NAS CPUs must satisfy the same linear-work invariant as a native runner.
+  const { createRequire, Module } = require('node:module');
+  const fs = require('node:fs');
+  const file = require.resolve('../../src/shared/sessionUsageArchive');
+  const localRequire = createRequire(file);
+  const instrumented = new Module(file, module);
+  instrumented.filename = file;
+  let normalizedSessionVisits = 0;
+  instrumented.require = (id) => {
+    const loaded = localRequire(id);
+    if (id !== './usage') return loaded;
+    return {...loaded, normalizePeriod: (value) => {
+      normalizedSessionVisits += Object.keys(value?.sessions || {}).length;
+      return loaded.normalizePeriod(value);
+    }};
+  };
+  instrumented._compile(fs.readFileSync(file, 'utf8'), file);
+  const visible = instrumented.exports.applySessionUsageArchive({ allTime: { sessions: {} } }, archive, {
     now: new Date('2026-07-15T00:00:00.000Z')
   });
-  const elapsedMs = performance.now() - startedAt;
 
   assert.equal(Object.keys(visible.allTime.sessions).length, 2000);
-  assert.ok(elapsedMs < 250, `large archive apply took ${elapsedMs.toFixed(1)}ms`);
+  assert.equal(visible.allTime.totalTokens, 2001000);
+  assert.ok(normalizedSessionVisits <= 6 * 2000, `normalized ${normalizedSessionVisits} session entries`);
 });
 
 // Same invariant as the client archive: the periods a progressive preview omits
