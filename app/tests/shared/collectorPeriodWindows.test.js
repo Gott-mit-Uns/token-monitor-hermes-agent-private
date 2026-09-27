@@ -64,3 +64,15 @@ test('collectUsageOnce stamps updatedAt and periodWindows from one injected cloc
   assert.equal(summary.osVersion, '26.0');
   assert.deepEqual(summary.periodWindows, computePeriodWindows(now));
 });
+
+test('Shanghai deployment uses the correct early-morning day and month boundary', () => {
+  const {spawnSync} = require('node:child_process');
+  const collectorPath = require.resolve('../../src/shared/collector');
+  const script = `const {computePeriodWindows}=require(${JSON.stringify(collectorPath)}); console.log(JSON.stringify(computePeriodWindows(new Date('2026-10-01T00:30:00+08:00'))));`;
+  const result = spawnSync(process.execPath, ['-e', script], {env: {...process.env, TZ: 'Asia/Shanghai'}, encoding: 'utf8'});
+  assert.equal(result.status, 0, result.stderr);
+  const windows = JSON.parse(result.stdout);
+  assert.equal(windows.today.key, '2026-10-01');
+  assert.equal(windows.month.key, '2026-10');
+  assert.equal(windows.today.endsAt, '2026-10-01T16:00:00.000Z');
+});

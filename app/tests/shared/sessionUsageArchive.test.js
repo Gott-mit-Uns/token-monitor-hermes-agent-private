@@ -361,7 +361,7 @@ test('clears persisted archive data and treats a missing file as already clear',
   }), false);
 });
 
-test('allocates archived token components across models without rounding drift', () => {
+test('preserves session totals without inventing multi-model token components', () => {
   const summary = liveSummary();
   const session = summary.allTime.sessions['opencode:o1'];
   session.models = { alpha: 1, beta: 1, gamma: 1 };
@@ -371,9 +371,13 @@ test('allocates archived token components across models without rounding drift',
   const archive = captureSessionUsageArchive({}, summary, new Date('2026-07-09T08:15:00.000Z'));
   const visible = applySessionUsageArchive({ allTime: { sessions: {} } }, archive);
 
-  assert.equal(Object.values(visible.allTime.modelCacheReads).reduce((sum, value) => sum + value, 0), 2);
-  assert.equal(Object.values(visible.allTime.modelCacheWrites).reduce((sum, value) => sum + value, 0), 2);
-  assert.equal(Object.values(visible.allTime.modelOutputs).reduce((sum, value) => sum + value, 0), 2);
+  assert.equal(visible.allTime.cacheReadTokens, 2);
+  assert.equal(visible.allTime.cacheWriteTokens, 2);
+  assert.equal(visible.allTime.outputTokens, 2);
+  assert.deepEqual(visible.allTime.modelCacheReads, {});
+  assert.deepEqual(visible.allTime.modelCacheWrites, {});
+  assert.deepEqual(visible.allTime.modelOutputs, {});
+  assert.equal(visible.allTime.capabilities.tokenComponents, false);
 });
 
 test('allocates tied model remainders independently of map property order', () => {
@@ -439,4 +443,20 @@ test('reapplying an archive never invents a period the preview omitted', () => {
   assert.equal('month' in visible, false);
   assert.equal('allTime' in visible, false);
   assert.equal(visible.today.sessions['opencode:o1'].archived, true);
+});
+
+test('incremental capture reports changes without mutating the default caller archive', () => {
+  const snapshot = liveSummary();
+  const now = new Date('2026-07-09T08:15:00.000Z');
+  const original = captureSessionUsageArchive({}, snapshot, now);
+  const saved = JSON.stringify(original);
+  snapshot.allTime.sessions['opencode:o1'].totalTokens += 10;
+  captureSessionUsageArchive(original, snapshot, now);
+  assert.equal(JSON.stringify(original), saved);
+  let changed;
+  const updated = captureSessionUsageArchive(original, snapshot, now, {mutate: true, onChange: v => {changed = v;}});
+  assert.equal(updated, original);
+  assert.equal(changed, true);
+  captureSessionUsageArchive(updated, snapshot, now, {mutate: true, onChange: v => {changed = v;}});
+  assert.equal(changed, false);
 });

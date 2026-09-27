@@ -11,8 +11,10 @@ const {
   normalizeLimitsRefreshMs,
   parseBoolean,
   parseLimitProviders
-} = require('../shared/limitCollector');
-const { postSyncPayload } = require('../shared/syncPayload');
+} = require('../shared/limitsSettings');
+const { postAgentUsage } = require('./upload');
+const { createDeduplicatingDelivery } = require('./deliveryPolicy');
+const { createThrottledWriter } = require('./throttledWriter');
 const { applyProjectRollups } = require('../shared/usage');
 const { runAgent, runAgentOnce } = require('./runtime');
 const { mark } = require('./nasHealth');
@@ -96,6 +98,11 @@ const limitsOptions = {
   opencodeCookie
 };
 let sessionUsageArchive;
+const archiveWriter = createThrottledWriter({
+  intervalMs: 60000,
+  write: (archive) => writeSessionUsageArchive(archive, { reuseNormalized: true }),
+  onError: () => console.error('[session-archive] write failed; retry scheduled')
+});
 
 function summaryWithSessionUsageArchive(summary, now = new Date()) {
   if (!dryRun) mark('collectedAt');
@@ -103,37 +110,37 @@ function summaryWithSessionUsageArchive(summary, now = new Date()) {
   if (sessionUsageArchiveEnabled) {
     const archiveDate = sessionUsageArchiveDate(summary, now);
     const previous = sessionUsageArchive || readSessionUsageArchive();
-    const next = captureSessionUsageArchive(previous, summary, archiveDate);
-    if (!dryRun && JSON.stringify(next) !== JSON.stringify(previous)) {
-      try {
-        writeSessionUsageArchive(next);
-        sessionUsageArchive = next;
-      } catch (error) {
-        console.error(`[session-archive] write failed: ${error.message}`);
-      }
-    } else if (!dryRun) {
+    let changed = false;
+    const next = captureSessionUsageArchive(previous, summary, archiveDate, {
+      mutate: !dryRun,
+      onChange: (value) => { changed = value; }
+    });
+    if (!dryRun) {
       sessionUsageArchive = next;
+      if (changed) archiveWriter.update(next);
     }
-    visibleSummary = applySessionUsageArchive(summary, next, { now: archiveDate });
+    visibleSummary = applySessionUsageArchive(summary, next, { now: archiveDate, reuseNormalized: !dryRun });
   }
   return projectsEnabled ? applyProjectRollups(visibleSummary) : visibleSummary;
 }
 
-async function postUsage(summary) {
-  const { response } = await postSyncPayload(fetch, `${hubUrl}/api/ingest`, {
+const delivery = createDeduplicatingDelivery({
+  heartbeatMs: intervalMs,
+  send: (summary) => postAgentUsage({
+    fetchFn: fetch,
+    url: `${hubUrl}/api/ingest`,
     headers: { 'content-type': 'application/json', ...(secret ? { authorization: `Bearer ${secret}` } : {}) },
     summary,
+    timeoutMs: Number(process.env.TOKEN_MONITOR_UPLOAD_TIMEOUT_MS) || 30000,
     logger: (message) => console.warn(`[sync] ${message}`)
-  });
-  if (!response.ok) throw new Error(`Hub responded ${response.status}: ${(await response.text()).slice(0, 300)}`);
-  return response.json();
-}
+  }),
+  onSuccess: () => mark('uploadedAt')
+});
 
 async function deliver(summary) {
   if (dryRun) { console.log(JSON.stringify(summary, null, 2)); return; }
-  await postUsage(summary);
-  mark('uploadedAt');
-  console.log(`[${new Date().toISOString()}] posted ${summary.deviceId}: today=${summary.today.totalTokens} month=${summary.month.totalTokens} allTime=${summary.allTime.totalTokens}`);
+  const result = await delivery.deliver(summary);
+  if (result.sent) console.log(`[${new Date().toISOString()}] posted ${summary.deviceId}`);
 }
 
 function registerPidFile(stopRuntime) {
@@ -145,6 +152,7 @@ function registerPidFile(stopRuntime) {
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     process.on(sig, () => {
       try { stopRuntime?.(); } catch (_) {}
+      try { archiveWriter.stop(); } catch (_) { console.error('[session-archive] final write failed'); }
       cleanup();
       process.exit(0);
     });
@@ -152,7 +160,7 @@ function registerPidFile(stopRuntime) {
 }
 
 async function main() {
-  const startupMessage = `Token Monitor agent device=${deviceId} hub=${hubUrl} intervalMs=${intervalMs} watch=${watchEnabled} projects=${projectsEnabled ? 'on' : 'off'} history=${historyEnabled ? 'on' : 'off'} sessionArchive=${sessionUsageArchiveEnabled ? 'on' : 'off'} limits=${limitsEnabled ? `${limitProviders || 'none'}:${limitsRefreshMode === 'adaptive' ? 'adaptive' : `${limitsRefreshMs}ms`}` : 'off'}`;
+  const startupMessage = `Token Monitor agent device=${deviceId} intervalMs=${intervalMs} watch=${watchEnabled} projects=${projectsEnabled ? 'on' : 'off'} history=${historyEnabled ? 'on' : 'off'} sessionArchive=${sessionUsageArchiveEnabled ? 'on' : 'off'} limits=${limitsEnabled ? `${limitProviders || 'none'}:${limitsRefreshMode === 'adaptive' ? 'adaptive' : `${limitsRefreshMs}ms`}` : 'off'}`;
   if (dryRun) console.error(startupMessage);
   else console.log(startupMessage);
   if (!secret) console.warn('Warning: TOKEN_MONITOR_SECRET is not set. Posting without authorization header.');
@@ -172,6 +180,7 @@ async function main() {
   };
   if (once) {
     await runAgentOnce(runtimeOptions);
+    archiveWriter.stop();
     return;
   }
   runtimeHandle = runAgent(runtimeOptions);

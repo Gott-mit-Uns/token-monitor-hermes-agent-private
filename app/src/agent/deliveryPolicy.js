@@ -20,7 +20,24 @@ function stableSemanticJson(value) {
 }
 
 function semanticRecordFingerprint(record) {
-  return crypto.createHash('sha256').update(stableSemanticJson(record)).digest('hex');
+  const hash = crypto.createHash('sha256');
+  function append(value) {
+    if (Array.isArray(value)) {
+      hash.update('[');
+      value.forEach((item, i) => { if (i) hash.update(','); append(item); });
+      hash.update(']');
+    } else if (value && typeof value === 'object') {
+      hash.update('{');
+      Object.keys(value).filter(key => !TRANSIENT_RECORD_KEYS.has(key)).sort().forEach((key, i) => {
+        if (i) hash.update(',');
+        hash.update(JSON.stringify(key) + ':');
+        append(value[key]);
+      });
+      hash.update('}');
+    } else hash.update(String(JSON.stringify(value)));
+  }
+  append(record);
+  return hash.digest('hex');
 }
 
 function createDeduplicatingDelivery(options = {}) {

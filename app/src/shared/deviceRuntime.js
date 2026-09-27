@@ -1,7 +1,19 @@
 'use strict';
 
 const { createDeviceState } = require('./deviceState');
-const { createLimitsRuntime } = require('./limitsRuntime');
+// Avoid loading provider implementations until limits are actually enabled.
+function createLimitsRuntime(options, deps) {
+  let runtime = null;
+  const ensure = () => runtime || (runtime = require('./limitsRuntime').createLimitsRuntime(options, deps));
+  if (options.limitsEnabled !== false) ensure();
+  return {
+    reconfigure(next) { options = { ...options, ...next }; return runtime ? runtime.reconfigure(options) : options.limitsEnabled !== false ? ensure() : null; },
+    refresh: (...args) => runtime ? runtime.refresh(...args) : Promise.resolve(false),
+    clear: (...args) => runtime ? runtime.clear(...args) : null,
+    getDiagnostics: () => runtime?.getDiagnostics?.() ?? null,
+    stop: () => runtime?.stop?.()
+  };
+}
 const { createUsageRuntime } = require('./usageRuntime');
 
 let nextRuntimeEpoch = 1;

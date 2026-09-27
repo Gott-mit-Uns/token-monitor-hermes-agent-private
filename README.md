@@ -8,7 +8,7 @@
 image: ghcr.io/gott-mit-uns/token-monitor-hermes:latest
 ```
 
-支持 `linux/amd64`（DXP4800）和 `linux/arm64`（DH4300plus）。`latest` 仅在发布前安全检查、构建及两种架构的 Agent 测试成功后更新。固定版本为 `0.54.0-nas.2`，每次构建还保留 `sha-<完整提交 SHA>` 标签。
+支持 `linux/amd64`（DXP4800）和 `linux/arm64`（DH4300plus）。`latest` 仅在发布前安全检查、构建及两种架构的 Agent 测试成功后更新。固定版本为 `0.54.0-nas.3`，每次构建还保留 `sha-<完整提交 SHA>` 标签。
 
 源码仓库和 `token-monitor-hermes` GHCR 镜像包现已公开，NAS 无需 GitHub 登录即可拉取 `latest`。已验证匿名访问镜像清单成功，支持 amd64 和 arm64。源码公开与镜像包公开是独立设置；以后新建其他镜像包时仍需单独核对可见性。不要提交 NAS 本地配置、凭据或运行数据。
 
@@ -82,8 +82,20 @@ docker exec token-monitor-hermes-agent node src/agent/nasHealth.js
 
 ## 构建来源
 
-上游 v0.54.0，提交 `fce070c789ae8b1ca59be3ce7c09fd8301d6f631`。NAS 镜像版本 `0.54.0-nas.2` 调整镜像发布方式，Agent 上游应用版本仍为 0.54.0。
+上游 v0.54.0，提交 `fce070c789ae8b1ca59be3ce7c09fd8301d6f631`。NAS 镜像版本 `0.54.0-nas.3` 调整镜像发布方式，Agent 上游应用版本仍为 0.54.0。
 
 Dockerfile 使用摘要固定的 Node 22 Bookworm slim，构建时执行官方 `ensure:tokscale` 步骤。桌面更新器与 Discord 依赖会被移除，共享原生依赖保留。启动时不安装依赖。
 
 许可证：[MIT](LICENSE)。上游更新仍需合并并验证，再发布新的 NAS 镜像；`latest` 不会自动拉入上游代码。
+
+## NAS 优化版 0.54.0-nas.3
+
+- 无统计变化时跳过重复上传，保留每 5 分钟心跳；真实变化仍会上传。
+- 上传总时限默认 30 秒，可通过 `TOKEN_MONITOR_UPLOAD_TIMEOUT_MS` 调整。超时后队列继续处理最新记录。
+- 会话归档复用规范化状态，以变化标记替代全量序列化比较；连续变化最多合并 60 秒后原子写盘，正常退出时保存。突然断电可能损失尚未落盘的最近归档更新。
+- 归档以紧凑 JSON 保存，文件格式与旧版本兼容，保留全部历史，不截断会话。
+- 额度采集关闭时延迟加载额度供应商模块；上传日志不再输出 token 用量或 Hub 地址。
+- Compose 明确采用 `Asia/Shanghai` 时区，并将文件事件防抖调整为 60 秒。已有容器需要更新 Compose 并重新创建才能应用这两项配置。
+- 固定版本在双架构测试通过后发布，已存在的版本标签不会被覆盖；`latest` 随验证成功的构建更新。版本号由 `nas-version.txt` 管理。
+
+更新前备份 Compose 和持久化状态目录。继续使用原设备 ID 和状态挂载目录，避免 Hub 出现新设备记录。保持 512 MiB 内存限制，待真实运行测量后再调整。此次优化没有承诺具体内存降幅，需通过更新后至少 24 小时观察验证。

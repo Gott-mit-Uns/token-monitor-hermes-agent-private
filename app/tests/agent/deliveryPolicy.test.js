@@ -73,3 +73,11 @@ test('writes the success heartbeat atomically', () => {
   assert.match(calls[1][1], /last-success\.\d+\.tmp$/);
   assert.equal(calls[2][2], '/config/Token Monitor/last-success');
 });
+
+test('deduplication retains date boundaries and session detail changes', () => {
+  const first = { ...record(10), periodWindows: {today: {key: '2026-09-28'}}, allTime: {sessions: {a: {totalTokens: 10}}}};
+  const nextDay = {...first, periodWindows: {today: {key: '2026-09-29'}}};
+  const nextSession = {...first, allTime: {sessions: {b: {totalTokens: 10}}}};
+  assert.notEqual(semanticRecordFingerprint(first), semanticRecordFingerprint(nextDay));
+  assert.notEqual(semanticRecordFingerprint(first), semanticRecordFingerprint(nextSession));
+});

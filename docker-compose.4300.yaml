@@ -10,6 +10,8 @@ services:
     env_file:
       - .env
     environment:
+      TZ: Asia/Shanghai
+      TOKEN_MONITOR_UPLOAD_TIMEOUT_MS: "30000"
       HERMES_HOME: /hermes
       HOME: /config
       XDG_CONFIG_HOME: /config
@@ -25,7 +27,7 @@ services:
       # Native events speed up updates; the 5-minute collector interval remains
       # as a fallback when no filesystem event arrives.
       TOKEN_MONITOR_WATCH: "1"
-      TOKEN_MONITOR_WATCH_DEBOUNCE_MS: "30000"
+      TOKEN_MONITOR_WATCH_DEBOUNCE_MS: "60000"
     mem_limit: 512m
     cpus: 0.50
     pids_limit: 64

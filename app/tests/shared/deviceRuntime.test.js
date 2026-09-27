@@ -197,3 +197,18 @@ test('runtime control wrappers do not delegate after stop', async () => {
 
   assert.deepEqual(calls, [['usageStop'], ['limitsStop']]);
 });
+
+test('disabled limits do not load provider modules in a fresh process', () => {
+  const {spawnSync} = require('node:child_process');
+  const modulePath = require.resolve('../../src/shared/deviceRuntime');
+  const result = spawnSync(process.execPath, ['-e', `
+    const {createDeviceRuntime}=require(${JSON.stringify(modulePath)});
+    const runtime=createDeviceRuntime({limitsOptions:{limitsEnabled:false}}, {
+      createUsageRuntime:()=>({stop(){}})
+    });
+    console.log(Object.keys(require.cache).some(p=>p.endsWith('/limitCollector.js')));
+    runtime.stop();
+  `], {encoding:'utf8'});
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), 'false');
+});

@@ -69,9 +69,13 @@ function hasSessionUsage(session) {
   return numberValue(session?.totalTokens) > 0 || numberValue(session?.costUsd) > 0;
 }
 
-function normalizeSessionUsageArchive(value) {
+const normalizedArchives = new WeakSet();
+
+function normalizeSessionUsageArchive(value, options = {}) {
+  if (options.reuseNormalized && normalizedArchives.has(value)) return value;
   const source = value?.sessions && typeof value.sessions === 'object' ? value.sessions : value;
   const normalized = { version: 1, sessions: {} };
+  normalizedArchives.add(normalized);
   if (!source || typeof source !== 'object') return normalized;
 
   for (const [rawKey, rawEntry] of Object.entries(source)) {
@@ -113,8 +117,9 @@ function normalizeSessionUsageArchive(value) {
   return normalized;
 }
 
-function captureSessionUsageArchive(existingArchive, deviceRecord, capturedAt = new Date()) {
-  const archive = normalizeSessionUsageArchive(existingArchive);
+function captureSessionUsageArchive(existingArchive, deviceRecord, capturedAt = new Date(), options = {}) {
+  const archive = normalizeSessionUsageArchive(existingArchive, { reuseNormalized: options.mutate === true });
+  let changed = false;
   if (!deviceRecord || typeof deviceRecord !== 'object') return archive;
 
   const captureDate = toDate(capturedAt);
@@ -152,9 +157,11 @@ function captureSessionUsageArchive(existingArchive, deviceRecord, capturedAt = 
       if (periodName === 'today') entry.periodWindows[periodName].day = localDay(captureDate);
       if (periodName === 'month') entry.periodWindows[periodName].month = localMonth(captureDate);
       archive.sessions[archiveKey] = entry;
+      changed = true;
     }
   }
 
+  options.onChange?.(changed);
   return archive;
 }
 
@@ -258,7 +265,7 @@ function shouldApplyPeriod(periodName, entry, now) {
 }
 
 function applySessionUsageArchive(summary, archive, options = {}) {
-  const normalizedArchive = normalizeSessionUsageArchive(archive);
+  const normalizedArchive = normalizeSessionUsageArchive(archive, options);
   const now = toDate(options.now);
   const next = clone(summary);
   const periodContainer = next.periods && typeof next.periods === 'object' ? next.periods : next;
@@ -301,7 +308,7 @@ function readSessionUsageArchive(options = {}) {
 
 function writeSessionUsageArchive(archive, options = {}) {
   const write = options.writeJsonAtomic || writeJsonAtomic;
-  write(sessionUsageArchivePath(options), normalizeSessionUsageArchive(archive));
+  write(sessionUsageArchivePath(options), normalizeSessionUsageArchive(archive, options), { compact: true });
 }
 
 function clearSessionUsageArchive(options = {}) {

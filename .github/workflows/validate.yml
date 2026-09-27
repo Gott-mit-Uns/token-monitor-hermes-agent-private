@@ -20,10 +20,16 @@ jobs:
           fetch-depth: 0
       - name: Check publication safety
         run: python3 scripts/check-publication-safety.py
+      - name: Read NAS version
+        id: version
+        run: |
+          version=$(cat nas-version.txt)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-nas\.[0-9]+$ ]]
+          echo "value=$version" >> "$GITHUB_OUTPUT"
       - name: Build and test without NAS data
         run: |
           docker build -t token-monitor-test .
-          docker run --rm -v "$PWD/app/tests:/opt/token-monitor/tests:ro" token-monitor-test node --test 'tests/agent/*.test.js'
+          docker run --rm -v "$PWD/app/tests:/opt/token-monitor/tests:ro" -v "$PWD/app/scripts:/opt/token-monitor/scripts:ro" token-monitor-test node scripts/test-nas.js
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
@@ -34,7 +40,7 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and publish versioned image
+      - name: Build and publish candidate image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -42,10 +48,9 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/gott-mit-uns/token-monitor-hermes:0.54.0-nas.2
             ghcr.io/gott-mit-uns/token-monitor-hermes:sha-${{ github.sha }}
           build-args: |
-            BUILD_VERSION=0.54.0-nas.2
+            BUILD_VERSION=${{ steps.version.outputs.value }}
             VCS_REF=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -55,9 +60,23 @@ jobs:
           for platform in linux/amd64 linux/arm64; do
             docker pull --platform "$platform" "$image"
             docker run --rm --platform "$platform" \
-              -v "$PWD/app/tests:/opt/token-monitor/tests:ro" \
-              "$image" node --test 'tests/agent/*.test.js'
+              -v "$PWD/app/tests:/opt/token-monitor/tests:ro" -v "$PWD/app/scripts:/opt/token-monitor/scripts:ro" \
+              "$image" node scripts/test-nas.js
           done
+      - name: Publish immutable version after verification
+        env:
+          NAS_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          version_image=ghcr.io/gott-mit-uns/token-monitor-hermes:${NAS_VERSION}
+          if docker buildx imagetools inspect "$version_image" >/tmp/version-inspect.out 2>/tmp/version-inspect.err; then
+            echo "Version already exists; preserving its published image."
+          elif grep -Eqi 'manifest unknown|not found' /tmp/version-inspect.err; then
+            docker buildx imagetools create --tag "$version_image" \
+              ghcr.io/gott-mit-uns/token-monitor-hermes:sha-${GITHUB_SHA}
+          else
+            echo "Unable to confirm version absence; refusing to publish a fixed tag."
+            exit 1
+          fi
       - name: Promote verified image to latest
         run: |
           docker buildx imagetools create \
