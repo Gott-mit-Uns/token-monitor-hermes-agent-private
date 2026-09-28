@@ -16,10 +16,14 @@ function freshCollector() {
 const {
   configFingerprint,
   collectUsageOnce,
-  localTodayKey
+  localTodayKey,
+  qoderCnSourcesForClients
 } = require('../../src/shared/collector');
 
 const { emptyPeriod } = require('../../src/shared/usage');
+const { installInProcessWatchHost } = require('../helpers/watchHost');
+
+installInProcessWatchHost(test);
 
 const baseOptions = {
   clients: 'claude',
@@ -48,6 +52,40 @@ test('configFingerprint normalizes clients and includes allTimeSince and project
   assert.notEqual(a, e, 'project tracking changes should invalidate persisted anchors');
 });
 
+test('configFingerprint invalidates the anchor when the Qoder CN JSONL source moves', () => {
+  const legacy = configFingerprint('qodercn', '2024-01-01', true, '/cn/local.db');
+  assert.notEqual(
+    configFingerprint('qodercn', '2024-01-01', true, '/cn/local.db', '/home/.qoder-cn/projects'),
+    legacy,
+    'an anchor captured before the JSONL source existed must not be trusted for month/allTime'
+  );
+  assert.notEqual(
+    configFingerprint('qodercn', '2024-01-01', true, '/cn/local.db', '/moved/projects'),
+    configFingerprint('qodercn', '2024-01-01', true, '/cn/local.db', '/home/.qoder-cn/projects'),
+    'changing TOKEN_MONITOR_QODER_CN_PROJECTS_PATH must invalidate the anchor'
+  );
+  assert.equal(
+    configFingerprint('qodercn', '2024-01-01', true, '/cn/local.db', ''),
+    legacy,
+    'an empty projects source keeps the pre-JSONL fingerprint byte-identical'
+  );
+});
+
+test('qoderCnSourcesForClients resolves the JSONL projects dir alongside the legacy DB', () => {
+  const sources = qoderCnSourcesForClients('qodercn', {
+    homeDir: '/Users/test',
+    platform: 'darwin',
+    env: { TOKEN_MONITOR_QODER_CN_PROJECTS_PATH: '/custom/cn/projects' }
+  });
+  assert.equal(sources.projectsDir, path.resolve('/custom/cn/projects'));
+  assert.match(sources.dbPath, /QoderCN/);
+  assert.deepEqual(
+    qoderCnSourcesForClients('claude', { homeDir: '/Users/test', platform: 'darwin', env: {} }),
+    { dbPath: '', projectsDir: '' },
+    'clients without qodercn resolve no sources and keep the fingerprint unchanged'
+  );
+});
+
 test('configFingerprint handles undefined and empty clients', () => {
   const a = configFingerprint(undefined, '2024-01-01');
   assert.equal(a, '|2024-01-01|projects:on', 'undefined clients should produce empty string before pipe');
@@ -57,6 +95,34 @@ test('configFingerprint handles undefined and empty clients', () => {
 
   const c = configFingerprint('claude', undefined);
   assert.match(c, /\|undefined\|projects:on$/, 'undefined allTimeSince produces string "undefined"');
+});
+
+test('configFingerprint labels the Qoder CN database path explicitly', () => {
+  const dbPath = path.join(os.tmpdir(), 'QoderCN', 'SharedClientCache', 'cache', 'db', 'local.db');
+  const fingerprint = configFingerprint(
+    'claude,qodercn',
+    '2024-01-01',
+    true,
+    dbPath
+  );
+  assert.equal(
+    fingerprint,
+    `claude,qodercn|2024-01-01|projects:on|qodercn:${path.resolve(dbPath)}`
+  );
+});
+
+test('configFingerprint invalidates the anchor when a custom scan path changes', () => {
+  const scanPath = process.platform === 'win32' ? 'C:\\tmp\\claude-alt' : '/tmp/claude-alt';
+  const other = process.platform === 'win32' ? 'C:\\tmp\\claude-other' : '/tmp/claude-other';
+  const none = configFingerprint('claude', '2024-01-01', true, '', '');
+  // No custom paths keeps the legacy fingerprint, so existing anchors stay valid on upgrade.
+  assert.equal(configFingerprint('claude', '2024-01-01', true, '', '', {}), none);
+  assert.equal(configFingerprint('claude', '2024-01-01', true, '', '', null), none);
+  assert.equal(configFingerprint('claude', '2024-01-01', true, '', '', { claude: [] }), none);
+  // Adding a path changes the fingerprint; a different path changes it again.
+  const withPath = configFingerprint('claude', '2024-01-01', true, '', '', { claude: [scanPath] });
+  assert.notEqual(withPath, none);
+  assert.notEqual(configFingerprint('claude', '2024-01-01', true, '', '', { claude: [other] }), withPath);
 });
 
 test('anchored tick with valid anchor runs todayOnly scan and derives month/allTime', async () => {
@@ -108,6 +174,98 @@ test('anchored tick with valid anchor runs todayOnly scan and derives month/allT
 
   // allTime = anchor allTime 5000 + (today 80 - anchor today 50) = 5030
   assert.equal(summary.allTime.totalTokens, 5030, 'allTime should be derived via applyPeriodDelta');
+});
+
+test('anchored tick replaces a stale anchor title with the freshly resolved rename', async () => {
+  const dateKey = localTodayKey();
+  const sessionKey = 'cursor:conv-1';
+  const makeSession = (title, totalTokens) => ({
+    client: 'cursor',
+    sessionId: 'conv-1',
+    totalTokens,
+    models: { 'cursor-model': totalTokens },
+    ...(title ? { title } : {})
+  });
+
+  const anchorToday = emptyPeriod();
+  anchorToday.totalTokens = 50;
+  anchorToday.clients = { cursor: 50 };
+  anchorToday.sessions = { [sessionKey]: makeSession('Old name', 50) };
+
+  const anchorMonth = emptyPeriod();
+  anchorMonth.totalTokens = 500;
+  anchorMonth.clients = { cursor: 500 };
+  anchorMonth.sessions = { [sessionKey]: makeSession('Old name', 500) };
+
+  const anchorAllTime = emptyPeriod();
+  anchorAllTime.totalTokens = 5000;
+  anchorAllTime.clients = { cursor: 5000 };
+  anchorAllTime.sessions = { [sessionKey]: makeSession('Old name', 5000) };
+
+  const summary = await collectUsageOnce({
+    clients: 'cursor',
+    allTimeSince: '2024-01-01',
+    commandTimeoutMs: 1000,
+    deviceId: 'dev1',
+    limitsEnabled: false,
+    historyEnabled: false,
+    todayOnlyAnchor: { dateKey, today: anchorToday, month: anchorMonth, allTime: anchorAllTime },
+    runTokscale: async () => ({
+      entries: [{ client: 'cursor', sessionId: 'conv-1', model: 'cursor-model', input: 55, output: 0, cost: 0 }]
+    }),
+    sessionMetadataDeps: {
+      sessionMetadataResolvers: new Map([['cursor', (ids) => {
+        assert.ok(ids.has('conv-1'));
+        return new Map([['conv-1', { title: 'New name' }]]);
+      }]])
+    },
+    collectWslUsage: async () => ({ bundle: { today: null, month: null, allTime: null, detected: [], homes: [] }, detected: [] })
+  });
+
+  assert.equal(summary.today.sessions[sessionKey].title, 'New name');
+  assert.equal(summary.month.sessions[sessionKey].title, 'New name', 'a rename must reach the derived month window');
+  assert.equal(summary.allTime.sessions[sessionKey].title, 'New name', 'a rename must reach the derived all-time window');
+});
+
+test('full anchors persist local-only Reasonix native views alongside aggregate periods', async () => {
+  const tmpShared = fs.mkdtempSync(path.join(os.tmpdir(), 'tm-native-anchor-'));
+  const nativeView = {
+    sessions: { today: { 'reasonix:session': { client: 'reasonix', totalTokens: 12 } }, month: {}, allTime: {} },
+    projects: { today: { 'token monitor': { label: 'token-monitor', tokens: 12, clients: { reasonix: 12 } } }, month: {}, allTime: {} }
+  };
+  const nativeCache = { getView: () => nativeView };
+  const originalSharedDir = process.env.TOKEN_MONITOR_SHARED_DIR;
+  process.env.TOKEN_MONITOR_SHARED_DIR = tmpShared;
+  let handle;
+  try {
+    const { startCollector } = freshCollector();
+    const updates = [];
+    handle = startCollector({
+      ...baseOptions,
+      clients: 'reasonix',
+      projectsEnabled: true,
+      platform: 'linux',
+      wslScanEnabled: false,
+      reasonixNativeSessionsEnabled: true,
+      reasonixNativeSessionCache: nativeCache,
+      runTokscale: async () => ({ entries: [] }),
+      intervalMs: 60 * 60 * 1000,
+      watchEnabled: false,
+      onUpdate: (summary) => updates.push(summary)
+    });
+
+    await waitForCondition(() => updates.length === 1);
+    const saved = JSON.parse(fs.readFileSync(path.join(tmpShared, 'collector-anchor.json'), 'utf8'));
+    assert.equal(saved.cursorAutoModelVersion, 1);
+    assert.deepEqual(saved.nativeSessions, nativeView.sessions);
+    assert.deepEqual(saved.nativeProjects, nativeView.projects);
+  } finally {
+    if (handle) try { handle.stop(); } catch (_) {}
+    if (originalSharedDir === undefined) delete process.env.TOKEN_MONITOR_SHARED_DIR;
+    else process.env.TOKEN_MONITOR_SHARED_DIR = originalSharedDir;
+    delete require.cache[collectorPath];
+    fs.rmSync(tmpShared, { recursive: true, force: true });
+  }
 });
 
 function emptyWslBundle() {
@@ -477,3 +635,58 @@ function waitForCondition(predicate, timeoutMs = 4000) {
     }, 5);
   });
 }
+
+test('anchor trust separates "cannot be reused" from "cannot be dated"', () => {
+  // One policy, two consumers: startCollector reuses the periods and only loses
+  // its incremental shortcut when the capture time is unusable, while the
+  // widget's cold-start seed has nothing to stand on and declines. Keeping that
+  // split in one function is what stops the two from drifting apart.
+  const { collectorAnchorTrust, configFingerprint } = freshCollector();
+  const now = new Date(2026, 7, 8, 10, 0, 0);
+  const anchor = (overrides = {}) => ({
+    dateKey: '2026-08-08',
+    today: {}, month: {}, allTime: {},
+    configFingerprint: configFingerprint('claude', '2024-01-01', true),
+    fullScanAt: new Date(now.getTime() - 60_000).toISOString(),
+    ...overrides
+  });
+  const options = { clients: 'claude', allTimeSince: '2024-01-01', projectsEnabled: true, now };
+
+  assert.equal(collectorAnchorTrust(anchor(), options).capturedAtMs, now.getTime() - 60_000);
+
+  // Unusable outright.
+  assert.equal(collectorAnchorTrust(null, options), null);
+  assert.equal(collectorAnchorTrust(anchor({ dateKey: '2026-08-07' }), options), null);
+  assert.equal(collectorAnchorTrust(anchor({ allTime: null }), options), null);
+  assert.equal(collectorAnchorTrust(anchor(), { ...options, clients: 'claude,codex' }), null);
+  assert.equal(collectorAnchorTrust(anchor(), { ...options, projectsEnabled: false }), null);
+
+  // A custom scan path added after the anchor was written invalidates it; an
+  // anchor whose fingerprint already covers that path stays trusted.
+  const scanPath = process.platform === 'win32' ? 'C:\\tmp\\claude-alt' : '/tmp/claude-alt';
+  assert.equal(collectorAnchorTrust(anchor(), { ...options, customScanPaths: { claude: [scanPath] } }), null);
+  const scannedAnchor = anchor({ configFingerprint: configFingerprint('claude', '2024-01-01', true, '', '', { claude: [scanPath] }) });
+  assert.equal(
+    collectorAnchorTrust(scannedAnchor, { ...options, customScanPaths: { claude: [scanPath] } }).capturedAtMs,
+    now.getTime() - 60_000
+  );
+
+  // Usable, but undatable.
+  assert.equal(collectorAnchorTrust(anchor({ fullScanAt: undefined }), options).capturedAtMs, null);
+  assert.equal(collectorAnchorTrust(anchor({ fullScanAt: 'nope' }), options).capturedAtMs, null);
+  const future = new Date(now.getTime() + 60_000).toISOString();
+  assert.equal(collectorAnchorTrust(anchor({ fullScanAt: future }), options).capturedAtMs, null);
+});
+
+test('Cursor anchors from before the Auto model rename require a full scan', () => {
+  const { collectorAnchorTrust, configFingerprint } = freshCollector();
+  const now = new Date(2026, 7, 8, 10, 0, 0);
+  const options = { clients: 'cursor', allTimeSince: '2024-01-01', now };
+  const anchor = {
+    dateKey: '2026-08-08', today: {}, month: {}, allTime: {},
+    configFingerprint: configFingerprint('cursor', '2024-01-01'),
+    fullScanAt: new Date(now.getTime() - 60_000).toISOString()
+  };
+  assert.equal(collectorAnchorTrust(anchor, options), null);
+  assert.equal(collectorAnchorTrust({ ...anchor, cursorAutoModelVersion: 1 }, options).capturedAtMs, now.getTime() - 60_000);
+});

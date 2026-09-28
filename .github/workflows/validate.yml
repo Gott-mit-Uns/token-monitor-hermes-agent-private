@@ -9,7 +9,7 @@ permissions:
   contents: read
   packages: write
 concurrency:
-  group: token-monitor-hermes-publish
+  group: token-monitor-nas-publish
   cancel-in-progress: false
 jobs:
   validate-and-publish:
@@ -23,8 +23,7 @@ jobs:
       - name: Read release version
         id: version
         run: |
-          version=$(node -p "require('./app/package.json').version")
-          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          version=$(node scripts/check-nas-version.js)
           echo "value=$version" >> "$GITHUB_OUTPUT"
       - name: Build and test without NAS data
         run: |
@@ -69,7 +68,8 @@ jobs:
         run: |
           version_image=ghcr.io/gott-mit-uns/token-monitor-hermes:${NAS_VERSION}
           if docker buildx imagetools inspect "$version_image" >/tmp/version-inspect.out 2>/tmp/version-inspect.err; then
-            echo "Version already exists; preserving its published image."
+            echo "Version already exists; refusing to overwrite or repoint latest."
+            exit 1
           elif grep -Eqi 'manifest unknown|not found' /tmp/version-inspect.err; then
             docker buildx imagetools create --tag "$version_image" \
               ghcr.io/gott-mit-uns/token-monitor-hermes:sha-${GITHUB_SHA}

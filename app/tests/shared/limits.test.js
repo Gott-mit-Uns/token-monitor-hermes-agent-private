@@ -10,9 +10,10 @@ const {
   normalizeLimitWindow,
   publicLimits,
   syncLimits
-} = require('../../src/shared/limits');
-const { collectLimitsOnce } = require('../../src/shared/limitCollector');
-const { codexAccountKey } = require('../../src/shared/codexAuth');
+} = require('../../src/shared/limits/core');
+const { collectLimitsOnce } = require('../../src/shared/limits/collector');
+const { codexAccountKey } = require('../../src/shared/providers/codex/auth');
+const { hashKey } = require('../../src/shared/hashKey');
 
 function codexProvider(accountKey, accountEmail, remainingPercent, updatedAt) {
   return {
@@ -282,6 +283,7 @@ test('aggregateLimits preserves distinct OpenRouter accounts and public stats sc
 test('aggregateLimits preserves distinct Third-party API accounts while keeping Base URLs off the wire', () => {
   const providers = ['工作', 'personal'].map((accountName, index) => normalizeLimitProvider({
     provider: 'thirdparty',
+    adapterId: index === 0 ? 'sub2api' : 'custom',
     accountKey: `sha256:thirdparty-${index}`,
     accountName,
     accountLabel: accountName,
@@ -304,7 +306,17 @@ test('aggregateLimits preserves distinct Third-party API accounts while keeping 
       requestCount: index + 10,
       quotaGroup: index === 0 ? 'default' : 'vip',
       expiresAt: '2027-01-15T08:00:00.000Z'
-    }
+    },
+    ...(index === 0 ? {
+      usageSummary: {
+        period: 'month',
+        requests: 10,
+        inputTokens: 200,
+        standardCost: 12,
+        actualCost: 3,
+        averageDurationMs: 400
+      }
+    } : {})
   }));
   const aggregate = aggregateLimits([{
     deviceId: 'macbook',
@@ -317,6 +329,8 @@ test('aggregateLimits preserves distinct Third-party API accounts while keeping 
   assert.equal(work.balance.requestCount, 10);
   assert.equal(work.balance.quotaGroup, 'default');
   assert.equal(work.balance.expiresAt, '2027-01-15T08:00:00.000Z');
+  assert.equal(work.adapterId, 'sub2api');
+  assert.equal(work.usageSummary.actualCost, 3);
   assert.equal(JSON.stringify(thirdparty).includes('http'), false);
 
   const publicPayload = publicLimits({ providers: thirdparty });
@@ -324,6 +338,7 @@ test('aggregateLimits preserves distinct Third-party API accounts while keeping 
   assert.ok(publicPayload.providers.every((provider) => !Object.hasOwn(provider, 'accountName')));
   assert.ok(publicPayload.providers.every((provider) => !Object.hasOwn(provider, 'accountLabel')));
   assert.ok(publicPayload.providers.every((provider) => !Object.hasOwn(provider, 'planLabel')));
+  assert.ok(publicPayload.providers.every((provider) => !Object.hasOwn(provider, 'usageSummary')));
   assert.ok(publicPayload.providers.every((provider) => !Object.hasOwn(provider.balance, 'quotaGroup')));
   assert.ok(publicPayload.providers.every((provider) => Object.hasOwn(provider.balance, 'requestCount')));
 });
@@ -816,6 +831,8 @@ test('OpenCode sync keeps the legacy profile label and explicit plan while publi
     providers: [{
       provider: 'opencode',
       accountKey: 'sha256:opencode-work',
+      webAccountKey: 'sha256:opencode-work',
+      accountKeyAliases: ['sha256:opencode-work-legacy'],
       accountName: 'work',
       accountLabel: 'work',
       planLabel: 'Go',
@@ -830,11 +847,227 @@ test('OpenCode sync keeps the legacy profile label and explicit plan while publi
   assert.equal(synced.accountName, 'work');
   assert.equal(synced.accountLabel, 'work');
   assert.equal(synced.planLabel, 'Go');
+  assert.equal(synced.webAccountKey, 'sha256:opencode-work');
+  assert.deepEqual(synced.accountKeyAliases, ['sha256:opencode-work-legacy']);
 
   const publicProvider = publicLimits(limits).providers[0];
   assert.equal(Object.hasOwn(publicProvider, 'accountName'), false);
   assert.equal(Object.hasOwn(publicProvider, 'accountLabel'), false);
   assert.equal(Object.hasOwn(publicProvider, 'planLabel'), false);
+  assert.equal(Object.hasOwn(publicProvider, 'webAccountKey'), false);
+  assert.equal(Object.hasOwn(publicProvider, 'accountKeyAliases'), false);
+});
+
+test('aggregateLimits merges complementary OpenCode components for one account', () => {
+  const aggregate = aggregateLimits([
+    {
+      deviceId: 'remote-device',
+      limits: {
+        updatedAt: '2026-08-09T08:01:00.000Z',
+        providers: [{
+          provider: 'opencode',
+          accountKey: 'sha256:shared',
+          webAccountKey: 'sha256:shared',
+          status: 'ok',
+          source: 'web',
+          updatedAt: '2026-08-09T08:01:00.000Z',
+          windows: [
+            { kind: 'session', source: 'local', usedPercent: 40 },
+            { kind: 'weekly', source: 'web', usedPercent: 20 }
+          ],
+          balanceUsd: 4
+        }]
+      }
+    },
+    {
+      deviceId: 'local-device',
+      limits: {
+        updatedAt: '2026-08-09T08:02:00.000Z',
+        providers: [{
+          provider: 'opencode',
+          accountKey: 'sha256:shared',
+          webAccountKey: 'sha256:shared',
+          status: 'ok',
+          source: 'web',
+          updatedAt: '2026-08-09T08:02:00.000Z',
+          windows: [{ kind: 'weekly', source: 'web', usedPercent: 10 }],
+          balanceUsd: 5
+        }]
+      }
+    }
+  ], 0, Date.parse('2026-08-09T08:03:00.000Z'));
+
+  assert.equal(aggregate.providers.length, 1);
+  assert.equal(aggregate.providers[0].balanceUsd, 5);
+  assert.equal(aggregate.providers[0].windows.find((window) => window.kind === 'session').remainingPercent, 60);
+  assert.equal(aggregate.providers[0].windows.find((window) => window.kind === 'weekly').remainingPercent, 90);
+});
+
+test('aggregateLimits resolves OpenCode components independently of device order', () => {
+  const newer = {
+    deviceId: 'newer-device',
+    limits: {
+      updatedAt: '2026-08-09T08:02:00.000Z',
+      providers: [{
+        provider: 'opencode',
+        accountKey: 'sha256:shared',
+        status: 'ok',
+        source: 'web',
+        updatedAt: '2026-08-09T08:02:00.000Z',
+        windows: [
+          { kind: 'session', source: 'web', usedPercent: 30 },
+          { kind: 'weekly', source: 'web', usedPercent: 40 }
+        ]
+      }]
+    }
+  };
+  const older = {
+    deviceId: 'older-device',
+    limits: {
+      updatedAt: '2026-08-09T08:01:00.000Z',
+      providers: [{
+        provider: 'opencode',
+        accountKey: 'sha256:shared',
+        status: 'ok',
+        source: 'web',
+        updatedAt: '2026-08-09T08:01:00.000Z',
+        windows: [
+          { kind: 'session', source: 'web', usedPercent: 10 },
+          { kind: 'weekly', source: 'web', usedPercent: 20 },
+          { kind: 'monthly', source: 'web', usedPercent: 50 }
+        ]
+      }]
+    }
+  };
+  const now = Date.parse('2026-08-09T08:03:00.000Z');
+  const forward = aggregateLimits([newer, older], 0, now);
+  const reverse = aggregateLimits([older, newer], 0, now);
+  const percentages = (aggregate) => Object.fromEntries(
+    aggregate.providers[0].windows.map((window) => [window.kind, window.usedPercent])
+  );
+
+  assert.deepEqual(percentages(forward), { session: 30, weekly: 40, billing: 50 });
+  assert.equal(forward.providers[0].updatedAt, '2026-08-09T08:02:00.000Z');
+  assert.equal(forward.providers[0].sourceDeviceId, 'newer-device');
+  assert.deepEqual(reverse, forward);
+});
+
+test('aggregateLimits preserves Go authority within one legacy OpenCode observation', () => {
+  const aggregateLegacy = (windows) => aggregateLimits([{
+    deviceId: 'legacy-device',
+    limits: {
+      updatedAt: '2026-08-09T08:00:00.000Z',
+      providers: [{
+        provider: 'opencode',
+        accountKey: 'sha256:legacy',
+        status: 'ok',
+        source: 'web',
+        updatedAt: '2026-08-09T08:00:00.000Z',
+        windows
+      }]
+    }
+  }], 0, Date.parse('2026-08-09T08:01:00.000Z')).providers[0];
+
+  const largerSubscriptionDuplicate = aggregateLegacy([
+    // Released collectors appended Go Web first, then subscription.get.
+    { kind: 'session', usedPercent: 40 },
+    { kind: 'session', usedPercent: 90 },
+    // A non-overlapping subscription window must remain available as a supplement.
+    { kind: 'weekly', usedPercent: 25 }
+  ]);
+  assert.deepEqual(
+    Object.fromEntries(largerSubscriptionDuplicate.windows.map((window) => [window.kind, window.usedPercent])),
+    { session: 40, weekly: 25 }
+  );
+
+  const smallerSubscriptionDuplicates = aggregateLegacy([
+    { kind: 'session', usedPercent: 80 },
+    { kind: 'weekly', usedPercent: 70 },
+    { kind: 'session', usedPercent: 9 },
+    { kind: 'weekly', usedPercent: 6 }
+  ]);
+  assert.deepEqual(
+    Object.fromEntries(smallerSubscriptionDuplicates.windows.map((window) => [window.kind, window.usedPercent])),
+    { session: 80, weekly: 70 }
+  );
+});
+
+test('aggregateLimits merges legacy OpenCode Go and Zen identities into the canonical workspace account', () => {
+  const workspaceId = 'wrk_rolling_upgrade';
+  const canonical = hashKey('opencode', `workspace:${workspaceId}`);
+  const legacyKeys = [
+    hashKey('opencode', `go:${workspaceId}`),
+    hashKey('opencode', `zen:${workspaceId}`)
+  ];
+  const current = {
+    deviceId: 'current-device',
+    limits: {
+      providers: [{
+        provider: 'opencode',
+        accountKey: canonical,
+        webAccountKey: canonical,
+        accountKeyAliases: legacyKeys,
+        status: 'ok',
+        source: 'web',
+        updatedAt: '2026-08-09T08:02:00.000Z',
+        windows: [{ kind: 'session', source: 'web', usedPercent: 30 }]
+      }]
+    }
+  };
+
+  for (const [index, legacyKey] of legacyKeys.entries()) {
+    const legacy = {
+      deviceId: `legacy-device-${index}`,
+      limits: {
+        providers: [{
+          provider: 'opencode',
+          accountKey: legacyKey,
+          status: 'ok',
+          source: 'web',
+          updatedAt: '2026-08-09T08:01:00.000Z',
+          windows: [{ kind: 'monthly', source: 'web', usedPercent: 50 }]
+        }]
+      }
+    };
+    const forward = aggregateLimits([current, legacy], 0, Date.parse('2026-08-09T08:03:00.000Z'));
+    const reverse = aggregateLimits([legacy, current], 0, Date.parse('2026-08-09T08:03:00.000Z'));
+
+    assert.equal(forward.providers.length, 1);
+    assert.equal(forward.providers[0].accountKey, canonical);
+    assert.equal(forward.providers[0].windows.find((window) => window.kind === 'session').usedPercent, 30);
+    assert.equal(forward.providers[0].windows.find((window) => window.kind === 'billing').usedPercent, 50);
+    assert.deepEqual(reverse, forward);
+  }
+});
+
+test('aggregateLimits keeps merged OpenCode account aliases bounded and deterministic', () => {
+  const canonical = 'sha256:canonical-workspace';
+  const provider = (deviceId, aliases) => ({
+    deviceId,
+    limits: {
+      providers: [{
+        provider: 'opencode',
+        accountKey: canonical,
+        webAccountKey: canonical,
+        accountKeyAliases: aliases,
+        status: 'ok',
+        source: 'web',
+        updatedAt: '2026-08-09T08:02:00.000Z',
+        windows: [{ kind: 'session', source: 'web', usedPercent: 30 }]
+      }]
+    }
+  });
+  const firstAliases = Array.from({ length: 8 }, (_, index) => `sha256:legacy-${String(index).padStart(2, '0')}`);
+  const secondAliases = Array.from({ length: 8 }, (_, index) => `sha256:legacy-${String(index + 8).padStart(2, '0')}`);
+  const first = provider('first-device', firstAliases);
+  const second = provider('second-device', secondAliases);
+  const now = Date.parse('2026-08-09T08:03:00.000Z');
+  const forward = aggregateLimits([first, second], 0, now);
+  const reverse = aggregateLimits([second, first], 0, now);
+
+  assert.deepEqual(forward.providers[0].accountKeyAliases, firstAliases);
+  assert.equal(forward.providers[0].accountKeyAliases.length, 8);
+  assert.deepEqual(reverse, forward);
 });
 
 test('collectLimitsOnce flattens multiple providers returned by a provider fetcher', async () => {
@@ -852,6 +1085,285 @@ test('collectLimitsOnce flattens multiple providers returned by a provider fetch
   assert.deepEqual(
     new Set(summary.providers.map((provider) => provider.accountKey)),
     new Set(['sha256:codex-a', 'sha256:codex-b'])
+  );
+});
+
+test('aggregateLimits preserves distinct Cursor accounts and deduplicates the same account across devices', () => {
+  const cursorProvider = (accountKey, accountEmail, planLabel, usedPercent, updatedAt) => ({
+    provider: 'cursor',
+    accountKey,
+    accountEmail,
+    accountLabel: accountEmail,
+    planLabel,
+    status: 'ok',
+    source: 'web',
+    updatedAt,
+    windows: [{ kind: 'billing', label: 'Total', usedPercent }]
+  });
+  const aggregate = aggregateLimits([
+    {
+      deviceId: 'this-mac',
+      limits: {
+        providers: [
+          cursorProvider('sha256:cursor-a', 'a@example.com', 'Free', 10, '2026-08-26T10:00:00.000Z'),
+          cursorProvider('sha256:cursor-b', 'b@example.com', 'Pro', 20, '2026-08-26T10:01:00.000Z')
+        ]
+      }
+    },
+    {
+      deviceId: 'office-pc',
+      limits: {
+        providers: [
+          cursorProvider('sha256:cursor-a', 'a@example.com', 'Free', 30, '2026-08-26T10:02:00.000Z')
+        ]
+      }
+    }
+  ], 0, Date.parse('2026-08-26T10:03:00.000Z'));
+
+  const cursorRows = aggregate.providers.filter((provider) => provider.provider === 'cursor');
+  assert.equal(cursorRows.length, 2);
+  assert.deepEqual(cursorRows.map((provider) => provider.accountEmail), ['a@example.com', 'b@example.com']);
+  assert.deepEqual(cursorRows.map((provider) => provider.planLabel), ['Free', 'Pro']);
+  assert.equal(cursorRows[0].sourceDeviceId, 'office-pc');
+  assert.equal(cursorRows[0].windows[0].usedPercent, 30);
+  assert.equal(cursorRows[1].sourceDeviceId, 'this-mac');
+});
+
+test('aggregateLimits preserves distinct Antigravity accounts and deduplicates trusted email identities across devices', () => {
+  const antigravityProvider = (accountKey, accountEmail, source, remainingPercent, updatedAt) => ({
+    provider: 'antigravity',
+    accountKey,
+    accountEmail,
+    accountLabel: 'Pro',
+    status: 'ok',
+    source,
+    sourceDetail: source === 'rpc' ? 'app' : 'oauth',
+    updatedAt,
+    windows: [{
+      kind: 'weekly',
+      label: 'Gemini weekly',
+      usedPercent: 100 - remainingPercent,
+      remainingPercent,
+      windowMinutes: 10_080
+    }]
+  });
+  const aggregate = aggregateLimits([
+    {
+      deviceId: 'macbook',
+      limits: {
+        providers: [
+          antigravityProvider('sha256:antigravity-a', ' A@Example.com ', 'oauth', 40, '2026-08-31T10:00:00.000Z')
+        ]
+      }
+    },
+    {
+      deviceId: 'desktop',
+      limits: {
+        providers: [
+          antigravityProvider('sha256:antigravity-a', 'a@example.com', 'rpc', 70, '2026-08-31T10:02:00.000Z'),
+          antigravityProvider('sha256:antigravity-b', 'b@example.com', 'oauth', 80, '2026-08-31T10:01:00.000Z')
+        ]
+      }
+    }
+  ], 0, Date.parse('2026-08-31T10:03:00.000Z'));
+
+  const antigravityRows = aggregate.providers.filter((provider) => provider.provider === 'antigravity');
+  assert.equal(antigravityRows.length, 2);
+  assert.deepEqual(antigravityRows.map((provider) => provider.accountEmail), ['a@example.com', 'b@example.com']);
+  assert.equal(antigravityRows[0].sourceDeviceId, 'desktop');
+  assert.equal(antigravityRows[0].source, 'rpc');
+  assert.equal(antigravityRows[0].windows[0].remainingPercent, 70);
+  assert.equal(antigravityRows[1].sourceDeviceId, 'desktop');
+});
+
+test('aggregateLimits keeps anonymous Antigravity RPC fallback identities device-scoped', () => {
+  const anonymousRpcProvider = (remainingPercent, updatedAt) => ({
+    provider: 'antigravity',
+    accountKey: 'sha256:antigravity-rpc-fallback',
+    status: 'ok',
+    source: 'rpc',
+    sourceDetail: 'app',
+    updatedAt,
+    windows: [{
+      kind: 'weekly',
+      label: 'Gemini weekly',
+      usedPercent: 100 - remainingPercent,
+      remainingPercent
+    }]
+  });
+  const aggregate = aggregateLimits([
+    {
+      deviceId: 'device-a',
+      limits: { providers: [anonymousRpcProvider(40, '2026-08-31T10:00:00.000Z')] }
+    },
+    {
+      deviceId: 'device-b',
+      limits: { providers: [anonymousRpcProvider(70, '2026-08-31T10:02:00.000Z')] }
+    }
+  ], 0, Date.parse('2026-08-31T10:03:00.000Z'));
+
+  const antigravityRows = aggregate.providers.filter((provider) => provider.provider === 'antigravity');
+  assert.equal(antigravityRows.length, 2);
+  assert.deepEqual(
+    new Set(antigravityRows.map((provider) => provider.sourceDeviceId)),
+    new Set(['device-a', 'device-b'])
+  );
+  assert.deepEqual(
+    new Set(antigravityRows.map((provider) => provider.windows[0].remainingPercent)),
+    new Set([40, 70])
+  );
+});
+
+test('aggregateLimits does not merge anonymous Antigravity RPC with managed OAuth', () => {
+  const sharedFallbackKey = 'sha256:antigravity-shared-fallback';
+  const aggregate = aggregateLimits([
+    {
+      deviceId: 'rpc-device',
+      limits: {
+        providers: [{
+          provider: 'antigravity',
+          accountKey: sharedFallbackKey,
+          status: 'ok',
+          source: 'rpc',
+          sourceDetail: 'app',
+          updatedAt: '2026-08-31T10:02:00.000Z',
+          windows: [{ kind: 'weekly', label: 'Gemini weekly', remainingPercent: 70 }]
+        }]
+      }
+    },
+    {
+      deviceId: 'oauth-device',
+      limits: {
+        providers: [{
+          provider: 'antigravity',
+          accountKey: sharedFallbackKey,
+          accountEmail: 'managed@example.com',
+          status: 'ok',
+          source: 'oauth',
+          sourceDetail: 'oauth',
+          updatedAt: '2026-08-31T10:01:00.000Z',
+          windows: [{ kind: 'weekly', label: 'Gemini weekly', remainingPercent: 80 }]
+        }]
+      }
+    }
+  ], 0, Date.parse('2026-08-31T10:03:00.000Z'));
+
+  const antigravityRows = aggregate.providers.filter((provider) => provider.provider === 'antigravity');
+  assert.equal(antigravityRows.length, 2);
+  assert.deepEqual(
+    new Set(antigravityRows.map((provider) => provider.sourceDeviceId)),
+    new Set(['rpc-device', 'oauth-device'])
+  );
+});
+
+// The collapse-by-name pass exists because one OAuth account hashes differently
+// per platform. Volcengine's accountKey is derived from the AK/SK and the
+// region, so it is identical on every device — the only way one account yields
+// two keys is the Coding/Agent plan split, which must survive to the hub.
+test('aggregateLimits keeps the Volcengine Coding and Agent plans as two rows', () => {
+  const now = '2026-06-24T10:00:00.000Z';
+  const aggregate = aggregateLimits([
+    {
+      deviceId: 'this-mac',
+      limits: {
+        updatedAt: now,
+        providers: [
+          {
+            provider: 'volcengine',
+            accountKey: 'sha256:volc-coding',
+            accountLabel: 'Coding Plan',
+            status: 'ok',
+            source: 'api',
+            updatedAt: now,
+            windows: [{ kind: 'session', label: '5-hour', usedPercent: 34 }]
+          },
+          {
+            provider: 'volcengine',
+            accountKey: 'sha256:volc-agent',
+            accountLabel: 'Agent Plan Medium',
+            status: 'ok',
+            source: 'api',
+            updatedAt: now,
+            windows: [{ kind: 'weekly', label: 'Weekly', usedPercent: 20 }]
+          }
+        ]
+      }
+    }
+  ], 0, Date.parse('2026-06-24T10:02:00.000Z'));
+
+  const volcengineRows = aggregate.providers.filter((provider) => provider.provider === 'volcengine');
+  assert.equal(volcengineRows.length, 2);
+  assert.deepEqual(volcengineRows.map((provider) => provider.accountLabel), ['Agent Plan Medium', 'Coding Plan']);
+});
+
+// Alibaba's accountKey is the console-issued account UID, so it is identical on
+// every platform: two keys mean two accounts. Without provider-scoped collapse
+// the second pass would fold them into one row and let whichever device synced
+// last silently replace the other.
+test('aggregateLimits keeps two Alibaba accounts apart and merges one across devices', () => {
+  const now = '2026-06-24T10:00:00.000Z';
+  const nowMs = Date.parse('2026-06-24T10:02:00.000Z');
+  const alibabaRow = (accountKey, accountLabel) => ({
+    provider: 'alibaba',
+    accountKey,
+    accountLabel,
+    status: 'ok',
+    source: 'web',
+    updatedAt: now,
+    windows: [{ kind: 'billing', used: 1, limit: 10 }]
+  });
+  const device = (deviceId, provider) => ({ deviceId, limits: { updatedAt: now, providers: [provider] } });
+  const labels = (aggregate) => aggregate.providers
+    .filter((provider) => provider.provider === 'alibaba')
+    .map((provider) => provider.accountLabel)
+    .sort();
+
+  assert.deepEqual(
+    labels(aggregateLimits([
+      device('mac', alibabaRow('sha256:account-a', 'Team A')),
+      device('win', alibabaRow('sha256:account-b', 'Team B'))
+    ], 0, nowMs)),
+    ['Team A', 'Team B']
+  );
+
+  assert.deepEqual(
+    labels(aggregateLimits([
+      device('mac', alibabaRow('sha256:account-a', 'Team A')),
+      device('win', alibabaRow('sha256:account-a', 'Team A'))
+    ], 0, nowMs)),
+    ['Team A']
+  );
+
+  // One Alibaba Cloud account can hold a Team and a Personal subscription at
+  // once, with quotas counted separately, so both rows carry the *same* account
+  // id. Identity alone would collide here and drop one plan; the aggregate key
+  // is scoped by the plan variant so both survive.
+  assert.deepEqual(
+    labels(aggregateLimits([
+      device('mac', { ...alibabaRow('sha256:account-a', 'Team A'), region: 'cn' }),
+      device('win', {
+        provider: 'alibaba',
+        accountKey: 'sha256:account-a',
+        accountLabel: 'Pro',
+        workspaceKind: 'personal',
+        region: 'cn-personal',
+        status: 'ok',
+        source: 'web',
+        updatedAt: now,
+        windows: [{ kind: 'session', usedPercent: 40 }]
+      })
+    ], 0, nowMs)),
+    ['Pro', 'Team A']
+  );
+
+  // The same plan seen from two devices still merges: scoping by variant must
+  // not turn one subscription into two rows.
+  assert.deepEqual(
+    labels(aggregateLimits([
+      device('mac', { ...alibabaRow('sha256:account-a', 'Team A'), region: 'cn' }),
+      device('win', { ...alibabaRow('sha256:account-a', 'Team A'), region: 'cn' })
+    ], 0, nowMs)),
+    ['Team A']
   );
 });
 
@@ -939,6 +1451,135 @@ test('normalizeLimitWindow normalizes the window currency', () => {
   assert.equal(normalizeLimitWindow({ kind: 'billing' }).currency, null);
 });
 
+test('normalizeLimitProvider preserves daily windows in canonical order', () => {
+  const provider = normalizeLimitProvider({
+    provider: 'volcengine',
+    status: 'ok',
+    windows: [
+      { kind: 'billing', label: 'Monthly', usedPercent: 40 },
+      { kind: 'daily', label: 'Daily', usedPercent: 20 },
+      { kind: 'weekly', label: 'Weekly', usedPercent: 30 },
+      { kind: 'session', label: '5-hour', usedPercent: 10 }
+    ]
+  });
+
+  assert.deepEqual(provider.windows.map((window) => window.kind), ['session', 'daily', 'weekly', 'billing']);
+});
+
+test('normalizeLimitProvider preserves only the bounded account action hint', () => {
+  const actionable = normalizeLimitProvider({
+    provider: 'antigravity',
+    status: 'unauthorized',
+    actionRequired: 'accountVerification',
+    windows: []
+  });
+  const unknown = normalizeLimitProvider({
+    provider: 'antigravity',
+    status: 'unauthorized',
+    actionRequired: 'open-provider-url',
+    windows: []
+  });
+
+  assert.equal(actionable.actionRequired, 'accountVerification');
+  assert.equal(Object.hasOwn(unknown, 'actionRequired'), false);
+});
+
+test('normalizeLimitProvider keeps the WorkBuddy app-session action hint', () => {
+  const sealed = normalizeLimitProvider({
+    provider: 'workbuddy',
+    status: 'notConfigured',
+    actionRequired: 'appSessionEncrypted',
+    windows: []
+  });
+
+  assert.equal(sealed.actionRequired, 'appSessionEncrypted');
+});
+
+test('normalizeLimitProvider keeps canonical Codex lanes ahead of named additional windows', () => {
+  const provider = normalizeLimitProvider({
+    provider: 'codex',
+    status: 'ok',
+    windows: [
+      { kind: 'weekly', label: 'Weekly', limitId: 'gpt-reserve', additional: true, usedPercent: 5 },
+      { kind: 'weekly', limitId: 'codex', usedPercent: 40 },
+      { kind: 'session', label: 'Session', limitId: 'gpt-reserve', additional: true, usedPercent: 10 },
+      { kind: 'session', limitId: 'codex', usedPercent: 20 }
+    ]
+  });
+
+  assert.deepEqual(provider.windows.map((window) => [window.kind, window.label, window.limitId, window.additional]), [
+    ['session', '', 'codex', undefined],
+    ['weekly', '', 'codex', undefined],
+    ['session', 'Session', 'gpt-reserve', true],
+    ['weekly', 'Weekly', 'gpt-reserve', true]
+  ]);
+});
+
+test('normalizeLimitWindow preserves bounded quota identity independently of its display label', () => {
+  const window = normalizeLimitWindow({
+    kind: 'weekly',
+    label: 'A backend quota name that is longer than thirty-two characters',
+    limitId: ' codex_special ',
+    additional: true
+  });
+
+  assert.equal(window.label, '');
+  assert.equal(window.limitId, 'codex_special');
+  assert.equal(window.additional, true);
+  assert.equal('additional' in normalizeLimitWindow({ kind: 'weekly', limitId: 'codex' }), false);
+  assert.equal('limitId' in normalizeLimitWindow({ kind: 'weekly', limitId: 'x'.repeat(129) }), false);
+});
+
+test('normalizeLimitProvider keeps Cursor dashboard quota order across window kinds', () => {
+  const provider = normalizeLimitProvider({
+    provider: 'cursor',
+    status: 'ok',
+    windows: [
+      { kind: 'billing', metric: 'spend', label: 'On-demand spend', used: 2, limit: 20, showMeter: false },
+      { kind: 'weekly', label: 'Grok Bot', usedPercent: 30 },
+      { kind: 'billing', label: 'Other Models', usedPercent: 20 },
+      { kind: 'billing', label: 'Cursor Models', usedPercent: 10 }
+    ]
+  });
+
+  assert.deepEqual(
+    provider.windows.map((window) => window.label),
+    ['Cursor Models', 'Other Models', 'Grok Bot', 'On-demand spend']
+  );
+});
+
+test('normalizeLimitWindow preserves only documented component sources', () => {
+  assert.equal(normalizeLimitWindow({ kind: 'session', source: ' local ' }).source, 'local');
+  assert.equal(normalizeLimitWindow({ kind: 'weekly', source: 'WEB' }).source, 'web');
+  assert.equal('source' in normalizeLimitWindow({ kind: 'session', source: 'oauth' }), false);
+  assert.equal('source' in normalizeLimitWindow({ kind: 'session' }), false);
+});
+
+test('normalizeLimitWindow preserves only documented quota boundary kinds', () => {
+  assert.equal(normalizeLimitWindow({ kind: 'billing', boundaryKind: ' expiry ' }).boundaryKind, 'expiry');
+  assert.equal(normalizeLimitWindow({ kind: 'daily', boundary_kind: 'RESET' }).boundaryKind, 'reset');
+  assert.equal(normalizeLimitWindow({ kind: 'billing', boundaryKind: 'mixed' }).boundaryKind, 'mixed');
+  assert.equal('boundaryKind' in normalizeLimitWindow({ kind: 'billing', boundaryKind: 'renewal' }), false);
+  assert.equal('boundaryKind' in normalizeLimitWindow({ kind: 'billing' }), false);
+});
+
+test('normalizeLimitWindow preserves WorkBuddy credits on the shared credits contract', () => {
+  const window = normalizeLimitWindow({
+    kind: 'billing',
+    label: 'Credits',
+    metric: 'credits',
+    currency: 'CREDITS',
+    used: 580.41,
+    limit: 1650,
+    remaining: 1069.59
+  });
+
+  assert.equal(window.metric, 'credits');
+  assert.equal(window.currency, 'CREDITS');
+  assert.equal(window.remaining, 1069.59);
+  assert.equal(window.remainingPercent, 64.824);
+});
+
 test('normalizeLimitProvider restores a balance window for pre-credits-window devices', () => {
   // An older device posts DeepSeek as a balance with no windows at all.
   const legacy = normalizeLimitProvider({
@@ -973,6 +1614,30 @@ test('normalizeLimitProvider never duplicates an existing credits window', () =>
 
   assert.equal(current.windows.length, 1);
   assert.equal(current.windows[0].label, 'Token quota');
+});
+
+test('normalizeLimitProvider never duplicates a WorkBuddy balance window', () => {
+  const current = normalizeLimitProvider({
+    provider: 'workbuddy',
+    accountKey: 'wb1',
+    status: 'ok',
+    updatedAt: '2026-07-26T00:00:00.000Z',
+    windows: [{
+      kind: 'billing',
+      label: 'Credits',
+      metric: 'credits',
+      currency: 'CREDITS',
+      remaining: 1069.59,
+      limit: 1650,
+      used: 580.41
+    }],
+    balance: { amount: 1069.59, currency: 'CREDITS' }
+  });
+
+  assert.equal(current.windows.length, 1);
+  assert.equal(current.windows[0].metric, 'credits');
+  assert.equal(current.windows[0].currency, 'CREDITS');
+  assert.equal(current.balance.currency, 'CREDITS');
 });
 
 test('normalizeLimitProvider leaves percentage-only providers alone', () => {
@@ -1121,4 +1786,154 @@ test('window metric accepts only the documented machine-readable roles', () => {
   assert.equal(normalizeLimitWindow({ kind: 'billing', metric: 'spend' }).metric, 'spend');
   // Anything else is dropped rather than carried onto the wire as a free-form tag.
   assert.equal('metric' in normalizeLimitWindow({ kind: 'billing', metric: 'whatever' }), false);
+});
+
+// Two devices reading the same account, one through the usage API and one
+// through the go-page scrape. Both read the same server-side counters, so the
+// newer reading is the better one and the merged row's provenance follows
+// whichever it was.
+function openCodeServerObservationDevices({ apiAt, webAt }) {
+  const window = (percent, source) => ({ kind: 'weekly', source, usedPercent: percent });
+  return [
+    {
+      deviceId: 'api-device',
+      limits: {
+        updatedAt: apiAt,
+        providers: [{
+          provider: 'opencode',
+          accountKey: 'sha256:shared',
+          webAccountKey: 'sha256:shared',
+          status: 'ok',
+          // API windows are tagged `web` on the wire so a Hub predating that
+          // value cannot rank them below a local estimate; the provider-level
+          // field is the only thing that says which server source produced them.
+          source: 'api',
+          updatedAt: apiAt,
+          windows: [window(57, 'web')],
+          balanceUsd: null
+        }]
+      }
+    },
+    {
+      deviceId: 'cookie-device',
+      limits: {
+        updatedAt: webAt,
+        providers: [{
+          provider: 'opencode',
+          accountKey: 'sha256:shared',
+          webAccountKey: 'sha256:shared',
+          status: 'ok',
+          source: 'web',
+          updatedAt: webAt,
+          windows: [window(11, 'web')],
+          balanceUsd: 4
+        }]
+      }
+    }
+  ];
+}
+
+test('aggregateLimits shows the freshest OpenCode server reading whichever source took it', () => {
+  const apiNewer = aggregateLimits(openCodeServerObservationDevices({
+    apiAt: '2026-08-09T08:00:01.000Z',
+    webAt: '2026-08-09T08:00:00.000Z'
+  }), 0, Date.parse('2026-08-09T08:00:10.000Z'));
+  const fromApi = apiNewer.providers.find((entry) => entry.provider === 'opencode');
+  assert.equal(fromApi.windows.find((window) => window.kind === 'weekly').remainingPercent, 43);
+  assert.equal(fromApi.source, 'api');
+  // The cookie is still the only source for the balance.
+  assert.equal(fromApi.balanceUsd, 4);
+
+  const cookieNewer = aggregateLimits(openCodeServerObservationDevices({
+    apiAt: '2026-08-09T08:00:00.000Z',
+    webAt: '2026-08-09T08:00:01.000Z'
+  }), 0, Date.parse('2026-08-09T08:00:10.000Z'));
+  const fromWeb = cookieNewer.providers.find((entry) => entry.provider === 'opencode');
+  assert.equal(fromWeb.windows.find((window) => window.kind === 'weekly').remainingPercent, 89);
+  assert.equal(fromWeb.source, 'web');
+});
+
+// A device is live until the staleness threshold, which reaches an hour on the
+// longest refresh interval. Preferring the API within that whole span would show
+// an hour-old reading beside a current one, so the skew has to lose to freshness
+// well before the API device goes stale.
+test('aggregateLimits prefers a current OpenCode cookie reading over a much older live API one', () => {
+  const devices = openCodeServerObservationDevices({
+    apiAt: '2026-08-09T07:32:00.000Z',
+    webAt: '2026-08-09T08:00:00.000Z'
+  });
+  for (const device of devices) device.limits.refreshMs = 30 * 60 * 1000;
+  devices[0].receivedAt = Date.parse('2026-08-09T07:32:00.000Z');
+  devices[1].receivedAt = Date.parse('2026-08-09T08:00:00.000Z');
+  const aggregate = aggregateLimits(devices, 10 * 60 * 1000, Date.parse('2026-08-09T08:00:10.000Z'));
+  const provider = aggregate.providers.find((entry) => entry.provider === 'opencode');
+  assert.equal(provider.windows.find((window) => window.kind === 'weekly').remainingPercent, 89);
+  assert.equal(provider.source, 'web');
+});
+
+test('aggregateLimits resolves the OpenCode merge independently of device order', () => {
+  const forward = openCodeServerObservationDevices({
+    apiAt: '2026-08-09T08:00:01.000Z',
+    webAt: '2026-08-09T08:00:00.000Z'
+  });
+  const aggregate = aggregateLimits(forward, 0, Date.parse('2026-08-09T08:00:10.000Z'));
+  const provider = aggregate.providers.find((entry) => entry.provider === 'opencode');
+  assert.equal(provider.windows.find((window) => window.kind === 'weekly').remainingPercent, 43);
+  assert.equal(provider.source, 'api');
+
+  const reversed = aggregateLimits([...forward].reverse(), 0, Date.parse('2026-08-09T08:00:10.000Z'));
+  const reversedProvider = reversed.providers.find((entry) => entry.provider === 'opencode');
+  assert.equal(reversedProvider.windows.find((window) => window.kind === 'weekly').remainingPercent, 43);
+  assert.equal(reversedProvider.source, 'api');
+});
+
+// Freshness decides between two server readings, but only among devices still
+// reporting: the merge drops stale providers first, so an API device that went
+// away cannot hold the row against a live cookie one.
+test('aggregateLimits lets a live OpenCode cookie observation beat a stale API one', () => {
+  const devices = openCodeServerObservationDevices({
+    apiAt: '2026-08-09T07:00:00.000Z',
+    webAt: '2026-08-09T08:00:00.000Z'
+  });
+  devices[0].receivedAt = Date.parse('2026-08-09T07:00:00.000Z');
+  devices[1].receivedAt = Date.parse('2026-08-09T08:00:00.000Z');
+  const aggregate = aggregateLimits(devices, 10 * 60 * 1000, Date.parse('2026-08-09T08:00:10.000Z'));
+  const provider = aggregate.providers.find((entry) => entry.provider === 'opencode');
+  assert.equal(provider.windows.find((window) => window.kind === 'weekly').remainingPercent, 89);
+  assert.equal(provider.source, 'web');
+});
+
+// The provider-level source is the envelope a Hub predating windows[].source
+// ranks on, so it may not claim a server reading while an estimate is in the
+// row. One local window makes the whole row an estimate, however fresh the Web
+// observation beside it is — the collector already states that rule for a
+// single device, and the merge has to keep it.
+test('aggregateLimits never labels a merged OpenCode row Web while a local window is in it', () => {
+  const aggregate = aggregateLimits([
+    {
+      deviceId: 'web-device',
+      limits: {
+        updatedAt: '2026-08-09T08:00:00.000Z',
+        providers: [{
+          provider: 'opencode', accountKey: 'sha256:shared', webAccountKey: 'sha256:shared',
+          status: 'ok', source: 'web', updatedAt: '2026-08-09T08:00:00.000Z',
+          windows: [{ kind: 'weekly', source: 'web', usedPercent: 20 }], balanceUsd: null
+        }]
+      }
+    },
+    {
+      deviceId: 'local-device',
+      limits: {
+        updatedAt: '2026-08-09T08:00:01.000Z',
+        providers: [{
+          provider: 'opencode', accountKey: 'sha256:shared', webAccountKey: 'sha256:shared',
+          status: 'ok', source: 'local', updatedAt: '2026-08-09T08:00:01.000Z',
+          windows: [{ kind: 'session', source: 'local', usedPercent: 90 }], balanceUsd: null
+        }]
+      }
+    }
+  ], 0, Date.parse('2026-08-09T08:00:10.000Z'));
+  const provider = aggregate.providers.find((entry) => entry.provider === 'opencode');
+  assert.equal(provider.windows.length, 2);
+  assert.equal(provider.source, 'local');
 });

@@ -8,14 +8,14 @@ RUN npm pkg delete dependencies.electron-updater 'dependencies.@xhayper/discord-
 
 FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
 
-ARG BUILD_VERSION=0.54.1
+ARG BUILD_VERSION=v0.63.1-01
 ARG VCS_REF=unknown
-ENV NODE_ENV=production
+ENV NODE_ENV=production TOKEN_MONITOR_NAS_VERSION=${BUILD_VERSION}
 WORKDIR /opt/token-monitor
 
 LABEL org.opencontainers.image.title="Token Monitor Hermes Agent" \
       org.opencontainers.image.description="NAS image for Hermes token monitoring" \
-      org.opencontainers.image.source="https://github.com/Gott-mit-Uns/token-monitor-hermes-agent-private" \
+      org.opencontainers.image.source="https://github.com/Gott-mit-Uns/token-monitor-nas" \
       org.opencontainers.image.version="${BUILD_VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.licenses="MIT"

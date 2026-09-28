@@ -26,6 +26,28 @@ const {
 
 const trailingPullRequestReference = /(?:\(\s*#\d+(?:\s*,\s*#\d+)*\s*\)|（\s*#\d+(?:\s*[、，,]\s*#\d+)*\s*）)$/;
 
+test('the automatic downloader stands down once an attempt is spent', () => {
+  const base = {
+    automaticAppUpdates: true,
+    updateState: {
+      hasUpdate: true,
+      installSupported: true,
+      dismissedVersion: null,
+      latest: { version: '0.43.0' },
+      downloaded: false,
+      installBusy: false,
+      installRetryBlocked: false
+    }
+  };
+  assert.equal(shouldDownloadAutomaticAppUpdate(base), true);
+  // Otherwise every background check re-downloads an artifact this process can
+  // never install, on a timer, for the rest of the session.
+  assert.equal(shouldDownloadAutomaticAppUpdate({
+    ...base,
+    updateState: { ...base.updateState, installRetryBlocked: true }
+  }), false);
+});
+
 test('source-mode release checks use the public GitHub page instead of the REST API', () => {
   assert.equal(RELEASES_LATEST_URL, 'https://github.com/Javis603/token-monitor/releases/latest');
 });
@@ -585,6 +607,11 @@ test('release template exposes marked summaries for every bundled locale', () =>
     /<details>\s*<summary>繁體中文 · 한국어 · 日本語<\/summary>[\s\S]*<details>\s*<summary><strong>繁體中文<\/strong><\/summary>[\s\S]*<details>\s*<summary><strong>한국어<\/strong><\/summary>[\s\S]*<details>\s*<summary><strong>日本語<\/strong><\/summary>/
   );
   assert.doesNotMatch(template, /其他語言|user-content-release-notes-/);
+  assert.doesNotMatch(
+    template,
+    /^- \*\*[^*\n]+\*\*\S/gm,
+    'bold release-note labels should be separated from their body text'
+  );
   assert.match(template, /## 繁體中文[\s\S]*## 下載/);
   assert.match(template, /## 한국어[\s\S]*## 다운로드/);
   assert.match(template, /## 日本語[\s\S]*## ダウンロード/);

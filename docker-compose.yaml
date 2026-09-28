@@ -1,7 +1,9 @@
+name: token-monitor-nas
+
 services:
-  token-monitor-hermes-agent:
+  token-monitor-nas:
     image: ghcr.io/gott-mit-uns/token-monitor-hermes:latest
-    container_name: token-monitor-hermes-agent
+    container_name: token-monitor-nas
     restart: unless-stopped
     init: true
     # The NAS ACL protects the Hermes directory. Run as its owner, with only
@@ -17,7 +19,7 @@ services:
       XDG_CONFIG_HOME: /config
       # Hub uses this ID as the display name. Edit it, then recreate the container.
       # A changed ID creates a new Hub record; the previous record is retained.
-      TOKEN_MONITOR_DEVICE_ID: Hermes-NAS-4800
+      TOKEN_MONITOR_DEVICE_ID: DXP4800
       TOKEN_MONITOR_CLIENTS: hermes
       TOKEN_MONITOR_INTERVAL_MS: "300000"
       TOKEN_MONITOR_PROJECTS_ENABLED: "0"

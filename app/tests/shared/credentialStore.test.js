@@ -43,6 +43,9 @@ test('stores credential settings in a versioned provider document', (t) => {
       }
     },
     zaiTeamOrganizationId: 'organization-id',
+    traeAccessToken: 'trae-token',
+    traeDeviceId: 'trae-device',
+    devinBearerToken: 'devin-token',
     qoderCookie: ''
   });
 
@@ -59,6 +62,9 @@ test('stores credential settings in a versioned provider document', (t) => {
   assert.equal(document.credentials.providers.thirdparty.profiles.relay.userId, '42');
   assert.equal(document.credentials.providers.thirdparty.profiles.relay.baseUrl, 'https://api.example.com');
   assert.equal(document.credentials.providers.zaiTeam.organizationId, 'organization-id');
+  assert.equal(document.credentials.providers.trae.accessToken, 'trae-token');
+  assert.equal(document.credentials.providers.trae.deviceId, 'trae-device');
+  assert.equal(document.credentials.providers.devin.bearerToken, 'devin-token');
   assert.equal(document.credentials.providers.qoder, undefined);
   assert.equal(document.migrations.settings, 1);
 
@@ -79,7 +85,10 @@ test('stores credential settings in a versioned provider document', (t) => {
     },
     deepseekApiKey: 'deepseek-key',
     kimiWebAccessToken: 'kimi-web-token',
-    zaiTeamOrganizationId: 'organization-id'
+    zaiTeamOrganizationId: 'organization-id',
+    traeAccessToken: 'trae-token',
+    traeDeviceId: 'trae-device',
+    devinBearerToken: 'devin-token'
   });
 });
 
@@ -187,6 +196,59 @@ test('reads private files through a validated descriptor', (t) => {
   assert.equal(typeof readTarget, 'number');
 });
 
+test('rejects private files larger than the configured read limit', (t) => {
+  const dataDir = tempDataDir(t);
+  const filePath = path.join(dataDir, 'oversized.json');
+  fs.writeFileSync(filePath, 'x'.repeat(33), 'utf8');
+  const fsApi = Object.create(fs);
+  let readCalls = 0;
+  fsApi.readFileSync = (...args) => {
+    readCalls += 1;
+    return fs.readFileSync(...args);
+  };
+
+  assert.throws(() => readRegularFileNoFollow(filePath, {
+    fs: fsApi,
+    description: 'Private file',
+    maxBytes: 32
+  }), /exceeds 32 bytes/);
+  assert.equal(readCalls, 0);
+});
+
+test('keeps bounded private reads bounded when the file grows after fstat', (t) => {
+  const dataDir = tempDataDir(t);
+  const filePath = path.join(dataDir, 'growing.json');
+  fs.writeFileSync(filePath, 'small', 'utf8');
+  const fsApi = Object.create(fs);
+  fsApi.fstatSync = (descriptor) => {
+    const stat = fs.fstatSync(descriptor);
+    fs.appendFileSync(filePath, 'x'.repeat(64), 'utf8');
+    return stat;
+  };
+
+  assert.throws(() => readRegularFileNoFollow(filePath, {
+    fs: fsApi,
+    description: 'Private file',
+    maxBytes: 16
+  }), /exceeds 16 bytes/);
+});
+
+test('bounded private reads continue after a short descriptor read', (t) => {
+  const dataDir = tempDataDir(t);
+  const filePath = path.join(dataDir, 'short-read.json');
+  fs.writeFileSync(filePath, 'complete', 'utf8');
+  const fsApi = Object.create(fs);
+  fsApi.readSync = (descriptor, buffer, offset, length, position) => (
+    fs.readSync(descriptor, buffer, offset, Math.min(length, 2), position)
+  );
+
+  assert.equal(readRegularFileNoFollow(filePath, {
+    fs: fsApi,
+    description: 'Private file',
+    maxBytes: 16
+  }), 'complete');
+});
+
 test('does not overwrite a corrupt credential store', (t) => {
   const dataDir = tempDataDir(t);
   const filePath = path.join(dataDir, 'credentials.json');
@@ -249,4 +311,35 @@ test('stores, migrates, and removes MiMo account cookies in the unified store', 
   assert.equal(store.removeMimoCredential('account-1'), true);
   assert.equal(store.readMimoCredential('account-1'), '');
   assert.equal(store.writeMimoCredential('__proto__', 'serviceToken=unsafe'), false);
+});
+
+test('stores and removes Antigravity OAuth credentials without exposing them as settings', (t) => {
+  const store = new CredentialStore(tempDataDir(t));
+  const credentials = {
+    accessToken: 'access-secret',
+    refreshToken: 'refresh-secret',
+    expiresAt: 12345,
+    clientId: 'client-id',
+    clientSecret: 'client-secret'
+  };
+  assert.equal(store.writeAntigravityCredential('account-1', credentials), true);
+  assert.deepEqual(store.readAntigravityCredential('account-1'), credentials);
+  assert.equal(store.settingsCredentials().antigravityManagedAccounts, undefined);
+  assert.equal(store.removeAntigravityCredential('account-1'), true);
+  assert.equal(store.readAntigravityCredential('account-1'), null);
+  assert.equal(store.writeAntigravityCredential('__proto__', credentials), false);
+});
+
+test('stores Zed dashboard Cookie as a fixed credential and redacts it for renderer settings', (t) => {
+  const store = new CredentialStore(tempDataDir(t));
+  store.replaceSettingsCredentials({ zedCookie: 'zed.session=secret; c15t=challenge' });
+  assert.equal(store.settingsCredentials().zedCookie, 'zed.session=secret; c15t=challenge');
+  assert.equal(credentialSettingsForRenderer({ zedCookie: 'secret' }).zedCookie, '');
+});
+
+test('stores TypeSafe Console Cookie outside settings and redacts it for the renderer', (t) => {
+  const store = new CredentialStore(tempDataDir(t));
+  store.replaceSettingsCredentials({ typesafeCookie: 'session=secret' });
+  assert.equal(store.settingsCredentials().typesafeCookie, 'session=secret');
+  assert.equal(credentialSettingsForRenderer({ typesafeCookie: 'session=secret' }).typesafeCookie, '');
 });

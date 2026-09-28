@@ -1,101 +1,48 @@
-# Token Monitor Hermes：NAS 用量采集 Agent
+# Token Monitor NAS
 
-基于 [Javis603/token-monitor](https://github.com/Javis603/token-monitor) 的 Hermes 采集器，为 NAS 提供 Docker 部署。采集 Hermes 的用量统计并发送到你配置的桌面 Token Monitor Hub。
+基于 [Token Monitor 官方项目](https://github.com/Javis603/token-monitor) 的 NAS Docker Agent，采集 Hermes 用量并同步到自己配置的桌面 Hub。当前官方源码基线是 `v0.63.1`，NAS 发布版本是 `v0.63.1-01`。官方提交及源码范围见 [UPSTREAM.md](UPSTREAM.md)。
 
-## 镜像与更新
+## 镜像、版本与更新
+
+镜像继续使用现有公开的 GHCR 包名，以免已有 NAS 部署的拉取地址失效：
 
 ```yaml
 image: ghcr.io/gott-mit-uns/token-monitor-hermes:latest
 ```
 
-支持 `linux/amd64`（DXP4800）和 `linux/arm64`（DH4300plus）。`latest` 仅在发布前安全检查、构建及两种架构的 Agent 测试成功后更新。固定版本为 `0.54.1`，每次构建还保留 `sha-<完整提交 SHA>` 标签。
+`latest` 指向最近一次通过双架构构建和测试的版本；也可以固定到 `ghcr.io/gott-mit-uns/token-monitor-hermes:v0.63.1-01`。支持 `linux/amd64` 与 `linux/arm64`。完整版本规则写在 [VERSIONING.md](VERSIONING.md)：官方版本作为前缀，每次引入新官方版本时 NAS 修订号从 `-01` 开始；同一官方版本上的 NAS 修改递增为 `-02`、`-03`。发布检查会校验版本号、Dockerfile 与官方 `app/package.json` 一致。固定镜像标签不覆盖，GitHub Release 与 Agent 上报使用相同版本。
 
-源码仓库和 `token-monitor-hermes` GHCR 镜像包现已公开，NAS 无需 GitHub 登录即可拉取 `latest`。已验证匿名访问镜像清单成功，支持 amd64 和 arm64。源码公开与镜像包公开是独立设置；以后新建其他镜像包时仍需单独核对可见性。不要提交 NAS 本地配置、凭据或运行数据。
-
-在原 Compose 所在目录运行：
+拉取并重新创建当前服务：
 
 ```sh
 docker compose pull
-docker compose up -d token-monitor-hermes-agent
+docker compose up -d token-monitor-nas
 ```
 
-已有部署迁移时，将 Compose 的 `image` 替换为上述地址，并删除 `build` 配置。保留原来的 `.env`、`state` 挂载、Hermes 只读挂载、设备 ID 和服务名称。镜像更名不要求移动 NAS 目录或改变容器名称。
+GitHub 上发布代码和镜像不会自动替 NAS 拉取镜像。旧的固定标签与提交 SHA 标签保留作回退用途。
 
-## 自定义桌面 Hub 中显示的设备名称
+## Compose 与设备名称
 
-当前桌面 Hub 使用 `deviceId` 作为显示名称。直接编辑 Compose 中的环境变量即可，例如：
+仓库提供 [DXP4800 模板](docker-compose.yaml) 和 [DH4300plus 模板](docker-compose.4300.yaml)。Compose 项目、服务与容器均名为 `token-monitor-nas`；两个模板继续使用各自原有的状态目录、Hermes 只读挂载和设备 ID。按实际路径调整后，将模板放到 NAS 上的项目目录，`.env` 留在该目录。首次部署可参考 [.env.example](.env.example)，不要提交实际 `.env`。
 
-```yaml
-environment:
-  TOKEN_MONITOR_DEVICE_ID: DXP4800
-```
+桌面 Hub 显示的名称由 `TOKEN_MONITOR_DEVICE_ID` 决定。DXP4800 模板为 `DXP4800`，DH4300plus 模板为 `DH4300Plus`。改动设备 ID 后须 `docker compose up -d --force-recreate token-monitor-nas`；Hub 会将新 ID 当成另一台设备，旧记录不会自动合并。普通版本升级不要改这个值。
 
-然后重新创建容器：
+默认每 5 分钟采集一次，也监听 Hermes 文件变化；文件事件防抖 60 秒。Compose 为 `Asia/Shanghai` 时区，保留 512 MiB 内存上限、只读根文件系统、Hermes 只读挂载、最小能力以及独立状态目录。额度和项目统计默认关闭，历史和会话归档开启。Agent 对未变化的记录去重，并保留心跳；上传总时限默认 30 秒。
+
+健康检查：
 
 ```sh
-docker compose up -d --force-recreate token-monitor-hermes-agent
+docker exec token-monitor-nas node src/agent/nasHealth.js
 ```
 
-首次成功上传后，Hub 会显示 `DXP4800`。若 Hub 暂时离线，会在恢复连接后的成功上传中显示；默认每五分钟采集，文件事件也可能提前触发。
+输出会分别报告采集和上传状态。Hub 暂时离线时上传状态可能过期；采集停滞才使 Docker 健康检查失败。Docker 不会因健康检查失败自行重启。
 
-**改设备 ID 会创建新的 Hub 记录，旧 `Hermes-NAS-4800` 记录会保留，并不是对原记录原地改名。** 程序不会自动删除旧记录、迁移 Hub 历史或合并设备。不要为普通镜像升级改设备 ID；不同 NAS 使用不同 ID。单纯 `docker restart` 或 `docker compose restart` 不会加载修改后的 Compose 环境变量。
+## 状态迁移与回退
 
-## 部署模板
-
-- `docker-compose.yaml`：DXP4800，默认使用 `/volume1/docker` 和 `Hermes-NAS-4800`。
-- `docker-compose.4300.yaml`：DH4300plus，默认使用 `/volume4/docker` 和 `Hermes-NAS-4300`。
-
-DH4300plus 上将模板保存为原项目路径下的 `docker-compose.yaml`，以保持绿联项目管理入口不变。`.env`、`state` 目录和挂载应继续使用原位置。
-
-首次部署，将 `.env.example` 复制为 NAS 本地 `.env`，填写桌面 Hub 地址与真实共享密钥。不要提交 `.env`。
+从 `0.54.1` 升级到本版时，官方会将 `session-usage-archive.json` 迁移到 SQLite，迁移成功后删除旧 JSON。**升级前停止 Agent，备份整个状态目录和 Compose、`.env`，并保留旧镜像。** 回退旧镜像时必须一并恢复迁移前的状态目录，单纯切换镜像标签不足以恢复旧版归档。不要执行 `docker compose down -v`。镜像升级不需要变更现有设备 ID 或移动状态目录。
 
 ## 数据与发布边界
 
-GitHub 构建只使用提交到仓库的源码与依赖，不连接你的 NAS、不挂载 Hermes 数据库，也不读取 NAS 本地 `.env` 或 `state`。Docker 构建上下文只允许 `app` 中指定的源码、依赖清单和构建脚本；最终镜像只复制 Agent、共享代码和安装后的依赖。
+GitHub Actions 只构建仓库源码和测试数据，不连接 NAS、不读取本地 `.env`、Hermes 数据库或状态目录。实际运行的 Agent 会读取 NAS 上的 Hermes 只读挂载，并向 `TOKEN_MONITOR_HUB_URL` 指定的 Hub 上传统计。发布前脚本检查常见密钥和运行数据路径；详情见 [SECURITY.md](SECURITY.md)。不要提交凭据和个人运行数据。
 
-Agent 在 NAS 正常运行时会读取只读挂载的 Hermes 数据库，并将用量记录发送到 `TOKEN_MONITOR_HUB_URL` 指定的 Hub。**这是向你配置的 Hub 同步，与向 GitHub 提交代码或发布镜像是两条独立流程。** 不应将生产 Agent 放在 GitHub 构建中运行；测试只使用仓库里的测试数据。
-
-`.gitignore` 排除 `.env`、数据库、状态目录、日志、备份和依赖目录。发布前脚本检查可达 Git 历史中的运行数据文件与常见密钥格式，并且只输出路径和问题类型，不输出命中的值。此检查不能识别所有秘密，也不能阻止手工强制添加数据文件，应结合人工审阅。
-
-本仓库包含 NAS 型号、示例目录结构及历史部署验证说明；公开仓库会公开这些说明和 Git 历史。详见 `SECURITY.md`。
-
-## 运行保护与健康检查
-
-- 为读取 NAS ACL 保护的目录，使用 root 身份，但移除全部能力，仅恢复 `DAC_READ_SEARCH`。
-- 根文件系统只读，Hermes 目录只读，写入状态放在单独的 `state` 挂载中。
-- 五分钟采集兜底，文件事件延迟 30 秒触发。
-- 分别记录成功采集与上传时间，不在健康状态中保存有效载荷或凭据。
-
-健康检查命令：
-
-```sh
-docker exec token-monitor-hermes-agent node src/agent/nasHealth.js
-```
-
-输出分别报告采集和上传为 `ok` 或 `stale`。默认过期阈值为 15 分钟，或三个更长的采集间隔。采集停滞、数据库不可读或进程缺失会导致 Docker 健康检查失败；只有上传过期不会使其失败，以免桌面 Hub 休眠引发误判。Docker 不会仅因容器不健康而自动重启。
-
-## 升级与回退
-
-升级前短暂停止 Agent，备份本地配置与状态，并保留旧镜像。回退时恢复匹配的配置和状态，以及固定版本镜像；不要使用 `docker compose down -v`。
-
-从原本地构建迁移后，旧镜像 `token-monitor-hermes-agent:0.54.0-nas.1` 仍可作为首次迁移的回退选择。不要改变绿联项目原有 Compose 文件路径。Hub 建议使用稳定的局域网地址。
-
-## 构建来源
-
-上游 v0.54.0，提交 `fce070c789ae8b1ca59be3ce7c09fd8301d6f631`。NAS 镜像版本 `0.54.1` 调整镜像发布方式，本项目的镜像、Release 和 Agent 上报版本统一为 0.54.1。
-
-Dockerfile 使用摘要固定的 Node 22 Bookworm slim，构建时执行官方 `ensure:tokscale` 步骤。桌面更新器与 Discord 依赖会被移除，共享原生依赖保留。启动时不安装依赖。
-
-许可证：[MIT](LICENSE)。上游更新仍需合并并验证，再发布新的 NAS 镜像；`latest` 不会自动拉入上游代码。
-
-## NAS 优化版 0.54.1
-
-- 无统计变化时跳过重复上传，保留每 5 分钟心跳；真实变化仍会上传。
-- 上传总时限默认 30 秒，可通过 `TOKEN_MONITOR_UPLOAD_TIMEOUT_MS` 调整。超时后队列继续处理最新记录。
-- 会话归档复用规范化状态，以变化标记替代全量序列化比较；连续变化最多合并 60 秒后原子写盘，正常退出时保存。突然断电可能损失尚未落盘的最近归档更新。
-- 归档以紧凑 JSON 保存，文件格式与旧版本兼容，保留全部历史，不截断会话。
-- 额度采集关闭时延迟加载额度供应商模块；上传日志不再输出 token 用量或 Hub 地址。
-- Compose 明确采用 `Asia/Shanghai` 时区，并将文件事件防抖调整为 60 秒。已有容器需要更新 Compose 并重新创建才能应用这两项配置。
-- 固定版本在双架构测试通过后发布，已存在的版本标签不会被覆盖；`latest` 随验证成功的构建更新。版本号由 `app/package.json` 管理，统一使用 `主版本.次版本.修订版本` 的纯数字格式，例如 `0.54.1`、`0.54.2`。
-
-更新前备份 Compose 和持久化状态目录。继续使用原设备 ID 和状态挂载目录，避免 Hub 出现新设备记录。保持 512 MiB 内存限制，待真实运行测量后再调整。此次优化没有承诺具体内存降幅，需通过更新后至少 24 小时观察验证。
+许可证：[MIT](LICENSE)。
