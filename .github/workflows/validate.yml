@@ -58,7 +58,7 @@ jobs:
           image=ghcr.io/gott-mit-uns/token-monitor-hermes:sha-${GITHUB_SHA}
           for platform in linux/amd64 linux/arm64; do
             docker pull --platform "$platform" "$image"
-            docker run --rm --platform "$platform" \
+            docker run --rm --platform "$platform" -e TOKEN_MONITOR_EMULATED_TESTS="${platform#linux/}" \
               -v "$PWD/app/tests:/opt/token-monitor/tests:ro" -v "$PWD/app/scripts:/opt/token-monitor/scripts:ro" \
               "$image" node scripts/test-nas.js
           done
