@@ -10,7 +10,7 @@ Windows x64 单文件 EXE，包含 Python 运行时；窗口需要 Microsoft Edg
 
 0.1.1 修复重复启动时误报端口占用，已有实例会重新显示窗口；增加 Windows 单实例回归测试。
 
-下载 TokenMonitorAdapter.exe 后运行，在设置页填写 HTTPS Hub 地址及同步密钥。默认每 10 分钟压缩下载、每 30 分钟由原 Token Monitor 客户端上报。勾选“接入 Token Monitor”会备份并修改客户端配置，需要重启原客户端。
+下载 TokenMonitorAdapter.exe 后运行，在设置页填写 HTTPS Hub 地址及同步密钥。默认每 10 分钟压缩下载、每 30 分钟由 Adapter 向远端上报；客户端实时提交到本机。勾选“接入 Token Monitor”会备份并修改客户端配置，需要重启原客户端。
 
 支持明暗主题、系统托盘、当前用户登录启动、手动同步、流量计量及本地 SSE。关闭窗口继续后台运行，托盘“退出”停止同步。
 
