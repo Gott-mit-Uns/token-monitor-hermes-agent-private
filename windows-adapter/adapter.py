@@ -349,6 +349,7 @@ class Adapter:
     def scheduler(self):
         while not self.stop.is_set():
             self.upload_pending()
+            if self.stop.is_set(): break
             try:
                 self.refresh()
             except UpstreamError:
