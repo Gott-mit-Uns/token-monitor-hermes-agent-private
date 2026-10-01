@@ -7,6 +7,18 @@ import settings
 from adapter import atomic_json
 
 class SettingsTests(unittest.TestCase):
+    def test_duplicate_instance_uses_ctypes_last_error(self):
+        import desktop
+        with tempfile.TemporaryDirectory() as name:
+            first,existing=desktop.instance_mutex(name)
+            second=None
+            try:
+                self.assertFalse(existing)
+                second,existing=desktop.instance_mutex(name)
+                self.assertTrue(existing)
+            finally:
+                if second: desktop.K.CloseHandle(second)
+                desktop.K.CloseHandle(first)
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.root=Path(self.temp.name)
         self.value={'upstream':'https://example.invalid','interval_seconds':600,'upload_interval_ms':1800000,'theme':'dark'}

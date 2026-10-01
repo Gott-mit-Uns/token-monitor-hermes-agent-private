@@ -16,7 +16,7 @@ import urllib.request
 from adapter import Adapter,Server,Handler,atomic_json
 import settings
 
-VERSION='0.1.0'
+VERSION='0.1.1'
 K=C.WinDLL('kernel32',use_last_error=True)
 K.CreateEventW.argtypes=[W.LPVOID,W.BOOL,W.BOOL,W.LPCWSTR]; K.CreateEventW.restype=W.HANDLE
 K.CreateMutexW.argtypes=[W.LPVOID,W.BOOL,W.LPCWSTR]; K.CreateMutexW.restype=W.HANDLE
@@ -34,6 +34,14 @@ def status(root):
     port=settings.load(root)['port']
     with urllib.request.urlopen(f'http://127.0.0.1:{port}/adapter/status',timeout=3) as r: return json.load(r)
 def message(text): C.windll.user32.MessageBoxW(None,text,'Token Monitor Adapter',0x10)
+
+def instance_mutex(root):
+    import hashlib
+    C.set_last_error(0)
+    handle=K.CreateMutexW(None,False,'Local\\TokenMonitorAdapter-'+hashlib.sha256(str(Path(root).resolve()).encode()).hexdigest()[:20])
+    error=C.get_last_error()
+    if not handle: raise OSError(error,'Unable to create adapter instance mutex')
+    return handle,error==183
 
 def worker(root):
     cfg=settings.load(root)
@@ -131,10 +139,10 @@ def main():
     if args.quit: K.SetEvent(event(root,'quit')); return
     if args.self_test: return self_test(root)
     if args.worker: return worker(root)
-    import hashlib
-    mutex=K.CreateMutexW(None,False,'Local\\TokenMonitorAdapter-'+hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:20])
-    if K.GetLastError()==183:
+    mutex,existing=instance_mutex(root)
+    if existing:
         if not args.background: K.SetEvent(event(root,'show'))
+        K.CloseHandle(mutex)
         return
     cfg=settings.load(root)
     try:
