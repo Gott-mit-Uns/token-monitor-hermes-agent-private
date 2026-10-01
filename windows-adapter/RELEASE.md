@@ -1,5 +1,7 @@
 Windows x64 单文件 EXE，包含 Python 运行时；窗口需要 Microsoft Edge WebView2 Runtime。
 
+0.1.2 采用紧凑的分组设置界面，明暗主题、行内选项和开关；诊断与接口明细可展开。保留手动同步和全部统计，保存设置时保留已有的程序启动位置。
+
 0.1.1 修复重复启动时误报端口占用，已有实例会重新显示窗口；增加 Windows 单实例回归测试。
 
 下载 TokenMonitorAdapter.exe 后运行，在设置页填写 HTTPS Hub 地址及同步密钥。默认每 10 分钟压缩下载、每 30 分钟由原 Token Monitor 客户端上报。勾选“接入 Token Monitor”会备份并修改客户端配置，需要重启原客户端。

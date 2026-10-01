@@ -30,6 +30,13 @@ class SettingsTests(unittest.TestCase):
         c=settings.save(self.root,self.value,'synthetic-secret')
         self.assertNotIn('secret',(self.root/'config.json').read_text())
         self.assertEqual(settings.remote_secret(self.root,c),'synthetic-secret')
+    def test_save_preserves_registered_executable_location(self):
+        exe=self.root/'chosen-location'/'TokenMonitorAdapter.exe'
+        exe.parent.mkdir();exe.write_bytes(b'synthetic executable')
+        with patch('winreg.CreateKey'),patch('winreg.QueryValueEx',return_value=('"'+str(exe)+'" --background',1)),patch('winreg.SetValueEx') as save,patch('settings.shutil.copy2') as copy:
+            self.assertEqual(settings.autostart(True,exe),exe)
+            copy.assert_not_called()
+            self.assertEqual(save.call_args.args[-1],'"'+str(exe)+'" --background')
     def test_pending_blocks_server_change_without_touching_key(self):
         settings.save(self.root,self.value,'old-synthetic-key')
         old=(self.root/'remote-secret.bin').read_bytes()
