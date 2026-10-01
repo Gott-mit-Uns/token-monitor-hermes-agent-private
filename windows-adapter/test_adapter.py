@@ -212,4 +212,60 @@ class Tests(unittest.TestCase):
         with patch('adapter.http.client.HTTPSConnection', Connection): self.a.http_request('POST', '/api/ingest', {'deviceId': 'Synthetic Desktop'})
         self.assertEqual(Tests.last_headers['x-token-monitor-response'], 'minimal')
 
+    def test_daily_midnight_persistence_and_legacy(self):
+        atomic = {'started_at': 100, 'upstream': {'GET /api/stats': {'download_body_bytes': 999}}, 'local': {}}
+        Path(self.temp.name, 'metrics.json').write_text(json.dumps(atomic))
+        resumed = Adapter(self.config, self.temp.name, version='synthetic-version')
+        self.assertEqual(resumed.status()['daily_traffic'], [])
+        with resumed.lock, patch('adapter.time.strftime', return_value='2026-10-01'):
+            resumed.record_daily(upload=10)
+        with resumed.lock, patch('adapter.time.strftime', return_value='2026-10-02'):
+            resumed.record_daily(download=20)
+        resumed.save()
+        loaded = Adapter(self.config, self.temp.name, version='synthetic-version')
+        rows = loaded.status()['daily_traffic']
+        self.assertEqual([r['date'] for r in rows], ['2026-10-02', '2026-10-01'])
+        self.assertEqual([r['total_body_bytes'] for r in rows], [20, 10])
+        self.assertEqual(loaded.metrics['upstream'], atomic['upstream'])
+        self.assertEqual(loaded.status()['version'], 'synthetic-version')
+        self.assertEqual(loaded.metrics['daily_started_at'], resumed.metrics['daily_started_at'])
+
+    def test_upload_phase_and_restored_pending(self):
+        self.assertEqual(self.a.status()['upload_phase'], 'waiting')
+        def transport(*args):
+            self.assertEqual(self.a.status()['upload_phase'], 'uploading')
+            raise UpstreamError(502, {'error': 'synthetic_failure'})
+        self.a.transport = transport
+        with self.assertRaises(UpstreamError):
+            self.a.ingest({'deviceId': 'Synthetic Desktop'})
+        self.assertEqual(self.a.status()['upload_phase'], 'retry')
+        self.assertGreater(self.a.status()['upload_retry_at'], time.time())
+        loaded = Adapter(self.config, self.temp.name, transport=lambda *args: {'ok': True})
+        self.assertEqual(loaded.status()['upload_phase'], 'retry')
+        loaded.retry_upload()
+        self.assertEqual(loaded.status()['upload_phase'], 'idle')
+        self.assertEqual(loaded.status()['upload_retry_at'], 0)
+
+    def test_daily_wire_failure_and_local_status_read(self):
+        raw = gzip.compress(encode({'error': 'synthetic_failure'}))
+        class Response:
+            status = 503
+            def getheader(self, name): return 'gzip' if name == 'Content-Encoding' else None
+            def read(self, _): return raw
+        class Connection:
+            def __init__(self, *args, **kwargs): pass
+            def request(self, *args): pass
+            def getresponse(self): return Response()
+            def close(self): pass
+        payload = {'deviceId': 'Synthetic Desktop'}
+        with patch('adapter.http.client.HTTPSConnection', Connection):
+            with self.assertRaises(UpstreamError): self.a.http_request('POST', '/api/ingest', payload)
+        row = self.a.status()['daily_traffic'][0]
+        self.assertEqual(row['upload_body_bytes'], len(encode(payload)))
+        self.assertEqual(row['download_body_bytes'], len(raw))
+        self.assertEqual(row['total_body_bytes'], len(raw) + len(encode(payload)))
+        self.start_http()
+        for _ in range(4): self.assertEqual(self.request('/adapter/status', auth=False)[1]['daily_traffic'], [row])
+        self.assertEqual(self.calls, [])
+
 if __name__ == '__main__': unittest.main(verbosity=2)

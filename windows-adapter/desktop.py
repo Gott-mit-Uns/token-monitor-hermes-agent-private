@@ -16,7 +16,7 @@ import urllib.request
 from adapter import Adapter,Server,Handler,atomic_json
 import settings
 
-VERSION='0.1.3'
+VERSION='0.1.4'
 K=C.WinDLL('kernel32',use_last_error=True)
 K.CreateEventW.argtypes=[W.LPVOID,W.BOOL,W.BOOL,W.LPCWSTR]; K.CreateEventW.restype=W.HANDLE
 K.CreateMutexW.argtypes=[W.LPVOID,W.BOOL,W.LPCWSTR]; K.CreateMutexW.restype=W.HANDLE
@@ -45,7 +45,7 @@ def instance_mutex(root):
 
 def worker(root):
     cfg=settings.load(root)
-    a=Adapter(cfg,root,secret_provider=lambda:settings.remote_secret(root,cfg),local_secret_provider=lambda:settings.local_secret(cfg))
+    a=Adapter(cfg,root,secret_provider=lambda:settings.remote_secret(root,cfg),local_secret_provider=lambda:settings.local_secret(cfg),version=VERSION)
     server=Server(('127.0.0.1',cfg['port']),Handler); server.adapter=a
     stop=event(root,'worker-stop',True)
     def watch():

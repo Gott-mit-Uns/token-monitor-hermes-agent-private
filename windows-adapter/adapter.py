@@ -32,8 +32,10 @@ class UpstreamError(Exception):
         self.body = body or {'error': 'upstream_unavailable'}
 
 class Adapter:
-    def __init__(self, config, root, transport=None, secret_provider=None, local_secret_provider=None):
+    def __init__(self, config, root, transport=None, secret_provider=None, local_secret_provider=None, version='development'):
         self.config, self.root = config, Path(root)
+        self.version = version
+        self.upload_in_progress = False
         self.root.mkdir(parents=True, exist_ok=True)
         self.interval = config.get('interval_seconds', 600)
         self.transport = transport or self.http_request
@@ -46,7 +48,8 @@ class Adapter:
         self.failures, self.next_retry = {}, {}
         self.clients = {}
         self.stop = threading.Event()
-        self.metrics = {'started_at': time.time(), 'upstream': {}, 'local': {}, 'last_upload_at': None}
+        self.metrics = {'started_at': time.time(), 'upstream': {}, 'local': {}, 'last_upload_at': None,
+                        'daily_started_at': time.time(), 'daily': {}}
         self.pending = None
         self.pending_generation = 0
         self.upload_failures = 0
@@ -93,6 +96,13 @@ class Adapter:
         except Exception:
             return False
 
+    def record_daily(self, upload=0, download=0):
+        # Call under self.lock, at each direction's accounting instant (local time).
+        day = time.strftime('%Y-%m-%d', time.localtime())
+        row = self.metrics['daily'].setdefault(day, {'upload_body_bytes': 0, 'download_body_bytes': 0})
+        row['upload_body_bytes'] += upload
+        row['download_body_bytes'] += download
+
     def http_request(self, method, path, body=None):
         base = urlsplit(self.config['upstream'])
         if base.scheme != 'https' or base.username or base.password or base.query or base.fragment:
@@ -111,6 +121,7 @@ class Adapter:
             meter = self.metrics['upstream'].setdefault(key, {'requests': 0, 'upload_body_bytes': 0, 'download_body_bytes': 0, 'failures': 0, 'gzip_responses': 0})
             meter['requests'] += 1
             meter['upload_body_bytes'] += len(data or b'')
+            self.record_daily(upload=len(data or b''))
         try:
             connection.request(method, base.path.rstrip('/') + path, data, headers)
             response = connection.getresponse()
@@ -119,6 +130,7 @@ class Adapter:
             raw = response.read(MAX_BODY + 1)
             with self.lock:
                 meter['download_body_bytes'] += len(raw)
+                self.record_daily(download=len(raw))
                 meter['gzip_responses'] += int(response.getheader('Content-Encoding') == 'gzip')
             if len(raw) > MAX_BODY:
                 raise UpstreamError(502, {'error': 'response_too_large'})
@@ -144,6 +156,7 @@ class Adapter:
             raise UpstreamError(502, {'error': 'upstream_connection_failed'}) from None
         finally:
             connection.close()
+            self.save()
 
     @staticmethod
     def valid(path, data):
@@ -171,7 +184,13 @@ class Adapter:
                     'state': 'waiting' if at is None else ('offline_cached' if self.failures.get('/api/stats') else ('stale' if age > self.interval + 60 else 'cached')),
                     'next_attempt_at': self.next_retry.get('/api/stats'), 'last_error': self.last_error,
                     'device_count': len(self.cache.get('/api/stats', {}).get('data', {}).get('devices', [])),
-                    'pending_upload': self.pending is not None, 'metrics': copy.deepcopy(self.metrics)}
+                    'pending_upload': self.pending is not None, 'metrics': copy.deepcopy(self.metrics),
+                    'version': self.version, 'upload_retry_at': self.upload_retry_at,
+                    'upload_phase': ('uploading' if self.upload_in_progress else 'retry' if self.pending is not None
+                                     else 'idle' if self.metrics.get('last_upload_at') else 'waiting'),
+                    'daily_started_at': self.metrics['daily_started_at'],
+                    'daily_traffic': [{'date': day, **row, 'total_body_bytes': row['upload_body_bytes'] + row['download_body_bytes']}
+                                      for day, row in sorted(self.metrics['daily'].items(), reverse=True)]}
 
     def refresh(self, path='/api/stats', manual=False):
         if path not in READ_PATHS:
@@ -231,6 +250,8 @@ class Adapter:
             return self._post_pending()
 
     def _post_pending(self):
+            with self.lock:
+                self.upload_in_progress = True
             payload = self.pending
             try:
                 response = self.transport('POST', '/api/ingest', payload)
@@ -253,6 +274,9 @@ class Adapter:
                     self.upload_retry_at = time.time() + min(600, 60 * 2 ** min(self.upload_failures - 1, 4))
                     self.save()
                 raise
+            finally:
+                with self.lock:
+                    self.upload_in_progress = False
 
     def retry_upload(self):
         with self.upload_lock:
