@@ -89,6 +89,9 @@ class Bridge:
     def get_settings(self):
         c=settings.load(self._host.root)
         return {k:c[k] for k in ('upstream','interval_seconds','upload_interval_ms','theme')}|{'key_saved':(self._host.root/'remote-secret.bin').exists(),'autostart':settings.startup_enabled(),'version':VERSION}
+    def exit_app(self):
+        threading.Thread(target=self._host.quit,daemon=True).start()
+        return {'ok':True}
     def save_settings(self,value):
         h=self._host
         try:
