@@ -1,6 +1,7 @@
 name: Windows Adapter EXE
 on:
   push:
+    branches: ['**']
     paths: ['windows-adapter/**', '.github/workflows/windows-adapter.yml']
     tags: ['adapter-v*']
   workflow_dispatch:
