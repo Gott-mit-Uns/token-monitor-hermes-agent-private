@@ -57,7 +57,7 @@ def run(root, open_window, exit_app):
     shell32.Shell_NotifyIconW.restype = W.BOOL
 
     mutex = kernel32.CreateMutexW(None, False, 'Local\\TokenMonitorExeTray'+str(config['port']))
-    if kernel32.GetLastError() == 183:
+    if C.get_last_error() == 183:
         sys.exit(0)
     icons = {name: user32.LoadImageW(None, str(root / ('icon-' + name + '.ico')), 1, 32, 32, 0x10)
              for name in ('green', 'amber', 'red')}
