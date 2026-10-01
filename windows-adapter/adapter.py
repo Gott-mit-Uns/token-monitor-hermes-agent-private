@@ -332,7 +332,8 @@ class Handler(BaseHTTPRequestHandler):
                 health = adapter.refresh('/api/health')
                 return self.reply(200, {'ok': True, 'role': 'hub', 'runtime': 'local-cache-adapter', 'version': 1,
                                         'deviceCount': adapter.status()['device_count'], 'secretRequired': True,
-                                        'adapter': adapter.status(), 'upstreamHubBuild': health.get('hubBuild')})
+                                        'adapter': adapter.status(), 'hubBuild': health.get('hubBuild'),
+                                        'upstreamHubBuild': health.get('hubBuild')})
             if not adapter.authorized(self.headers):
                 return self.reply(401, {'error': 'unauthorized'})
             if method == 'GET' and path == '/api/stats/stream':

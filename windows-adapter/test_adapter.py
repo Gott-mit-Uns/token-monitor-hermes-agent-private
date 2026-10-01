@@ -159,9 +159,23 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.request('/api/devices/NAS1', method='DELETE')[0], 403)
         self.assertEqual(self.request('/api/stats?secret=bad')[0], 400)
         health = self.request('/api/health', auth=False)[1]
-        self.assertNotIn('hubBuild', health)
+        self.assertEqual(health['hubBuild'], {'runtime': 'node-hub'})
+        self.assertEqual(health['hubBuild'], health['upstreamHubBuild'])
         self.assertEqual(health['runtime'], 'local-cache-adapter')
         self.assertEqual(len([r for r in self.calls if r[1] == '/api/history']), 1)
+    def test_health_build_passthrough_and_cache(self):
+        build = {'runtime': 'node-hub', 'schemaVersion': 1, 'coreRevision': 2,
+                 'runtimeRevision': 3, 'coreBuildId': 'sha256:' + 'a'*64,
+                 'runtimeBuildId': 'sha256:' + 'b'*64}
+        self.a.transport = lambda *args: {'role': 'hub', 'hubBuild': build}
+        self.start_http()
+        for _ in range(3):
+            self.assertEqual(self.request('/api/health', auth=False)[1]['hubBuild'], build)
+        self.a.cache['/api/health']['at'] -= 601
+        self.a.transport = lambda *args: {'role': 'hub'}
+        health = self.request('/api/health', auth=False)[1]
+        self.assertIn('hubBuild', health)
+        self.assertIsNone(health['hubBuild'])
     def test_sse_local_only_and_reconnection(self):
         self.start_http()
         for _ in range(3):
