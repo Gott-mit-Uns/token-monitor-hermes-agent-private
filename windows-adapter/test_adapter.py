@@ -251,6 +251,62 @@ class Tests(unittest.TestCase):
         self.assertEqual(resumed.upload_pending(),'backoff')
         self.assertEqual(resumed.status()['upload_retry_at'],self.a.status()['upload_retry_at'])
 
+    def test_token_delta_reasons_and_scope(self):
+        def submit(total, clients=None):
+            self.a.ingest({'deviceId':'Synthetic Desktop','allTime':{'totalTokens':total},'trackedClients':clients or ['synthetic-client']})
+        submit(100)
+        self.assertEqual(self.a.status()['pending_tokens']['reason'],'no_baseline')
+        self.a.upload_pending(manual=True)
+        submit(130)
+        self.assertEqual(self.a.status()['pending_tokens']['value'],30)
+        submit(100)
+        self.assertEqual(self.a.status()['pending_tokens']['value'],0)
+        submit(90)
+        self.assertEqual(self.a.status()['pending_tokens']['reason'],'counter_decreased')
+        submit(130,['other-client'])
+        self.assertEqual(self.a.status()['pending_tokens']['reason'],'scope_changed')
+        submit(True)
+        self.assertEqual(self.a.status()['pending_tokens']['reason'],'missing_fields')
+        submit(130)
+        self.a.config['upstream']='https://other.invalid'
+        self.assertEqual(self.a.status()['pending_tokens']['reason'],'identity_changed')
+        self.assertNotIn('token_baseline',self.a.status()['metrics'])
+
+    def test_token_baseline_sent_generation_failure_and_restart(self):
+        def snapshot(total): return {'deviceId':'Synthetic Desktop','periods':{'allTime':{'totalTokens':total}},'trackedClients':['synthetic-client']}
+        entered,release=threading.Event(),threading.Event()
+        def transport(*args):
+            entered.set();self.assertTrue(release.wait(3));return {'ok':True}
+        self.a.transport=transport
+        self.a.ingest(snapshot(100))
+        thread=threading.Thread(target=lambda:self.a.upload_pending(manual=True));thread.start()
+        self.assertTrue(entered.wait(3));self.a.ingest(snapshot(150));release.set();thread.join(3)
+        self.assertEqual(self.a.status()['pending_tokens']['value'],50)
+        def fail(*args): raise UpstreamError(503)
+        self.a.transport=fail
+        self.assertEqual(self.a.upload_pending(manual=True),'failed')
+        self.assertEqual(self.a.status()['pending_tokens']['value'],50)
+        loaded=Adapter(self.config,self.temp.name,transport=lambda *args:{'ok':True})
+        self.assertEqual(loaded.status()['pending_tokens']['value'],50)
+        self.assertEqual(loaded.status()['next_upload_at'],self.a.status()['next_upload_at'])
+        loaded.upload_retry_at=0;loaded.upload_pending(manual=True)
+        loaded.ingest(snapshot(160))
+        self.assertEqual(loaded.status()['pending_tokens']['value'],10)
+
+    def test_health_normal_queue_and_actual_failures(self):
+        self.a.refresh()
+        self.a.ingest({'deviceId':'Synthetic Desktop'})
+        self.assertEqual(self.a.status()['health_level'],'ok')
+        self.a.upload_in_progress=True
+        self.assertEqual(self.a.status()['health_level'],'ok')
+        self.a.upload_in_progress=False
+        self.a.upload_retry_at=time.time()+60
+        self.assertEqual(self.a.status()['health_level'],'warning')
+        self.a.upload_retry_at=0;self.a.failures['/api/stats']=1
+        self.assertEqual(self.a.status()['health_label'],'下载失败，使用缓存')
+        self.a.failures['/api/stats']=0;self.a.cache['/api/stats']['at']-=700
+        self.assertEqual(self.a.status()['health_level'],'warning')
+
     def test_wire_gzip_count_and_minimal_header(self):
         class Response:
             status = 200

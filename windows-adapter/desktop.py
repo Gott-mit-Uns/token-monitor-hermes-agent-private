@@ -16,7 +16,7 @@ import urllib.request
 from adapter import Adapter,Server,Handler,atomic_json
 import settings
 
-VERSION='0.1.5'
+VERSION='0.1.6'
 K=C.WinDLL('kernel32',use_last_error=True)
 K.CreateEventW.argtypes=[W.LPVOID,W.BOOL,W.BOOL,W.LPCWSTR]; K.CreateEventW.restype=W.HANDLE
 K.CreateMutexW.argtypes=[W.LPVOID,W.BOOL,W.LPCWSTR]; K.CreateMutexW.restype=W.HANDLE

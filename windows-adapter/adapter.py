@@ -187,12 +187,20 @@ class Adapter:
         with self.lock:
             at = self.cache.get('/api/stats', {}).get('at')
             age = time.time() - at if at else None
+            state = 'waiting' if at is None else ('offline_cached' if self.failures.get('/api/stats') else ('stale' if age > self.interval + 60 else 'cached'))
+            upload_failed = self.pending is not None and bool(self.upload_retry_at)
+            labels = {'waiting': '等待首次同步', 'offline_cached': '下载失败，使用缓存', 'stale': '缓存已过期'}
+            label = labels.get(state, '上报失败，等待重试' if upload_failed else '同步正常')
+            metrics = copy.deepcopy(self.metrics)
+            metrics.pop('token_baseline', None)
             return {'adapter': 'Token Monitor Hotspot Cache', 'interval_seconds': self.interval,
                     'last_success_at': at, 'cache_age_seconds': round(age, 1) if age is not None else None,
-                    'state': 'waiting' if at is None else ('offline_cached' if self.failures.get('/api/stats') else ('stale' if age > self.interval + 60 else 'cached')),
+                    'state': state, 'health_level': 'ok' if state == 'cached' and not upload_failed else 'warning', 'health_label': label,
                     'next_attempt_at': self.next_retry.get('/api/stats'), 'last_error': self.last_error,
                     'device_count': len(self.cache.get('/api/stats', {}).get('data', {}).get('devices', [])),
-                    'pending_upload': self.pending is not None, 'metrics': copy.deepcopy(self.metrics),
+                    'pending_upload': self.pending is not None, 'metrics': metrics,
+                    'pending_tokens': self.pending_token_summary(),
+                    'upload_progress_started_at': self.metrics['upload_schedule'].get('last_attempt_at', self.metrics['upload_schedule']['next_at'] - self.upload_interval),
                     'version': self.version, 'upload_retry_at': self.upload_retry_at,
                     'upload_phase': ('uploading' if self.upload_in_progress else ('retry' if self.upload_retry_at else 'queued') if self.pending is not None
                                      else 'idle' if self.metrics.get('last_upload_at') else 'waiting'),
@@ -203,6 +211,32 @@ class Adapter:
                     'daily_started_at': self.metrics['daily_started_at'],
                     'daily_traffic': [{'date': day, **row, 'total_body_bytes': row['upload_body_bytes'] + row['download_body_bytes']}
                                       for day, row in sorted(self.metrics['daily'].items(), reverse=True)]}
+
+    def token_summary(self, payload):
+        if not isinstance(payload, dict): return None
+        periods = payload.get('periods') if isinstance(payload.get('periods'), dict) else payload
+        period = periods.get('allTime')
+        total = period.get('totalTokens') if isinstance(period, dict) else None
+        clients = payload.get('trackedClients')
+        if type(total) is not int or total < 0 or not isinstance(clients, list) or not all(isinstance(c, str) for c in clients):
+            return None
+        return {'deviceId': self.config['device_id'], 'upstream': self.config['upstream'],
+                'tracked_clients': sorted(set(clients)), 'total_tokens': total}
+
+    def pending_token_summary(self):
+        def unavailable(reason): return {'value': None, 'calculable': False, 'reason': reason}
+        if self.pending is None: return unavailable('no_pending')
+        current = self.token_summary(self.pending)
+        if current is None: return unavailable('missing_fields')
+        baseline = self.metrics.get('token_baseline')
+        if not isinstance(baseline, dict): return unavailable('no_baseline')
+        if any(current[k] != baseline.get(k) for k in ('deviceId', 'upstream')): return unavailable('identity_changed')
+        if current['tracked_clients'] != baseline.get('tracked_clients'): return unavailable('scope_changed')
+        previous = baseline.get('total_tokens')
+        if type(previous) is not int or previous < 0: return unavailable('no_baseline')
+        delta = current['total_tokens'] - previous
+        if delta < 0: return unavailable('counter_decreased')
+        return {'value': delta, 'calculable': True, 'reason': 'snapshot_difference'}
 
     def refresh(self, path='/api/stats', manual=False):
         if path not in READ_PATHS:
@@ -302,6 +336,7 @@ class Adapter:
             try:
                 self.request_remote('POST', '/api/ingest', payload)
                 with self.lock:
+                    self.metrics['token_baseline'] = self.token_summary(payload)
                     if self.pending_generation == generation:
                         atomic_json(self.root / 'pending.json', None)
                         self.pending = None

@@ -105,13 +105,12 @@ def run(root, open_window, exit_app):
             return 0
         if message == 0x8002:
             state = status.get('state', 'waiting')
-            color = 'green' if state == 'cached' and not status.get('pending_upload') else ('red' if state == 'adapter_unavailable' else 'amber')
-            label = {'cached': '缓存同步正常', 'stale': '缓存已过期', 'waiting': '等待首次同步',
-                     'offline_cached': '远端离线，显示缓存', 'adapter_unavailable': '适配器未运行'}.get(state, state)
+            color = 'red' if state == 'adapter_unavailable' else 'green' if status.get('health_level') == 'ok' else 'amber'
+            label = '适配器未运行' if state == 'adapter_unavailable' else status.get('health_label', '等待首次同步')
             if status.get('pending_upload'):
-                label += '，有待上报数据'
+                label += '，' + {'queued': '等待定时上报', 'uploading': '正在上报', 'retry': '等待重试'}.get(status.get('upload_phase'), '有待上报数据')
             at = status.get('last_success_at')
-            tip = 'Token Monitor 热点同步：' + label
+            tip = 'Hub 中转：' + label
             if at:
                 tip += '\n最近下载 ' + time.strftime('%H:%M:%S', time.localtime(at)) + ' · 周期 '+str(status.get('interval_seconds',600))+'秒'
             icon.szTip, icon.hIcon = tip[:127], icons[color]
