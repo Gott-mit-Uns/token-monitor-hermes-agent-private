@@ -99,6 +99,10 @@ def autostart(enabled,executable):
     target=Path(os.environ['LOCALAPPDATA'])/'Programs'/'TokenMonitorAdapter'/'TokenMonitorAdapter.exe'
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER,r'Software\Microsoft\Windows\CurrentVersion\Run') as key:
         if enabled:
+            try:
+                existing=winreg.QueryValueEx(key,'TokenMonitorHotspotAdapter')[0]
+                if existing.startswith('"'+str(Path(executable))+'" '): target=Path(executable)
+            except FileNotFoundError: pass
             target.parent.mkdir(parents=True,exist_ok=True)
             if Path(executable).resolve()!=target.resolve(): shutil.copy2(executable,target)
             winreg.SetValueEx(key,'TokenMonitorHotspotAdapter',0,winreg.REG_SZ,'"'+str(target)+'" --background')
