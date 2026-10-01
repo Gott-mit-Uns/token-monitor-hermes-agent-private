@@ -62,7 +62,7 @@ def validate(value):
     try: u.port
     except ValueError: raise ValueError('服务器端口无效。') from None
     download=int(value.get('interval_seconds',600)); upload=int(value.get('upload_interval_ms',1800000))
-    if download not in (300,600,1800,3600) or upload not in (300000,600000,1800000,3600000):
+    if download not in (60,300,600,900,1800,3600) or upload not in (60000,300000,600000,900000,1800000,3600000):
         raise ValueError('请选择提供的同步周期。')
     theme=value.get('theme','system')
     if theme not in ('system','light','dark'): raise ValueError('主题无效。')
@@ -70,6 +70,9 @@ def validate(value):
 
 def save(root,value,key=''):
     root=Path(root); root.mkdir(parents=True,exist_ok=True); old=load(root); new={**old,**validate(value)}
+    for name, legacy in [('interval_seconds', 3600), ('upload_interval_ms', 3600000)]:
+        if new[name] == legacy and old.get(name) != legacy:
+            raise ValueError('60 分钟仅用于保留原配置，请选择新的同步周期。')
     if new['upstream']!=old['upstream']:
         try: pending=json.loads((root/'pending.json').read_text(encoding='utf-8'))
         except FileNotFoundError: pending=None
@@ -90,7 +93,7 @@ def connect_client(root,config):
     d=json.loads(path.read_text(encoding='utf-8-sig'))
     backup=Path(root)/'backups'; backup.mkdir(parents=True,exist_ok=True)
     shutil.copy2(path,backup/('settings-before-exe-'+str(time.time_ns())+'.json'))
-    d['hubUrl']='http://127.0.0.1:'+str(config['port']); d['syncUploadIntervalMs']=config['upload_interval_ms']
+    d['hubUrl']='http://127.0.0.1:'+str(config['port']); d['syncUploadIntervalMs']=0
     atomic_json(path,d)
     return '已备份并接入 Token Monitor；请重启 Token Monitor 客户端使设置生效。'
 

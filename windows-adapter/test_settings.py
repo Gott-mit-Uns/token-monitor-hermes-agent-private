@@ -52,7 +52,15 @@ class SettingsTests(unittest.TestCase):
         atomic_json(client/'settings.json',{'hubUrl':'https://example.invalid','deviceId':'Synthetic Desktop'})
         with patch('settings.client_root',return_value=client),patch('settings.local_secret',return_value='synthetic'):
             settings.connect_client(self.root,{'port':17322,'upload_interval_ms':1800000})
-        d=json.loads((client/'settings.json').read_text());self.assertEqual(d['syncUploadIntervalMs'],1800000)
+        d=json.loads((client/'settings.json').read_text());self.assertEqual(d['syncUploadIntervalMs'],0)
         self.assertEqual(d['hubUrl'],'http://127.0.0.1:17322');self.assertEqual(len(list((self.root/'backups').glob('*.json'))),1)
+    def test_new_periods_and_legacy_save(self):
+        for minutes in [1,5,10,15,30]:
+            value={**self.value,'interval_seconds':minutes*60,'upload_interval_ms':minutes*60000}
+            self.assertEqual(settings.validate(value)['interval_seconds'],minutes*60)
+        with self.assertRaises(ValueError):
+            settings.save(self.root,{**self.value,'interval_seconds':3600},'synthetic')
+        atomic_json(self.root/'config.json',{**self.value,'interval_seconds':3600})
+        self.assertEqual(settings.save(self.root,{**self.value,'interval_seconds':3600},'synthetic')['interval_seconds'],3600)
 
 if __name__=='__main__':unittest.main(verbosity=2)

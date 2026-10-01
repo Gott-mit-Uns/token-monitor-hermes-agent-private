@@ -49,7 +49,7 @@ class Adapter:
         self.clients = {}
         self.stop = threading.Event()
         self.metrics = {'started_at': time.time(), 'upstream': {}, 'local': {}, 'last_upload_at': None,
-                        'daily_started_at': time.time(), 'daily': {}}
+                        'daily_started_at': time.time(), 'daily': {}, 'history_started_at': time.time(), 'sync_history': {}, 'local_accepted_uploads': 0}
         self.pending = None
         self.pending_generation = 0
         self.upload_failures = 0
@@ -57,6 +57,14 @@ class Adapter:
         self.last_error = None
         self.local_port = config.get('port', 17322)
         self._load()
+        self.upload_interval = config.get('upload_interval_ms', 1800000) / 1000
+        schedule = self.metrics.setdefault('upload_schedule', {'started_at': time.time()})
+        if schedule.get('interval') != self.upload_interval or 'next_at' not in schedule:
+            schedule['next_at'] = schedule.get('last_attempt_at', schedule['started_at']) + self.upload_interval
+        schedule['interval'] = self.upload_interval
+        self.upload_retry_at = schedule.get('retry_at', 0)
+        self.upload_failures = schedule.get('failures', 0)
+        self.save()
 
     def _load(self):
         try:
@@ -186,8 +194,12 @@ class Adapter:
                     'device_count': len(self.cache.get('/api/stats', {}).get('data', {}).get('devices', [])),
                     'pending_upload': self.pending is not None, 'metrics': copy.deepcopy(self.metrics),
                     'version': self.version, 'upload_retry_at': self.upload_retry_at,
-                    'upload_phase': ('uploading' if self.upload_in_progress else 'retry' if self.pending is not None
+                    'upload_phase': ('uploading' if self.upload_in_progress else ('retry' if self.upload_retry_at else 'queued') if self.pending is not None
                                      else 'idle' if self.metrics.get('last_upload_at') else 'waiting'),
+                    'upload_interval_seconds': self.upload_interval, 'next_upload_at': self.metrics['upload_schedule']['next_at'],
+                    'sync_history_started_at': self.metrics['history_started_at'],
+                    'sync_history': [{'date': day, **copy.deepcopy(row)} for day, row in sorted(self.metrics['sync_history'].items(), reverse=True)],
+                    'manual_result': copy.deepcopy(self.metrics.get('manual_result')),
                     'daily_started_at': self.metrics['daily_started_at'],
                     'daily_traffic': [{'date': day, **row, 'total_body_bytes': row['upload_body_bytes'] + row['download_body_bytes']}
                                       for day, row in sorted(self.metrics['daily'].items(), reverse=True)]}
@@ -207,7 +219,7 @@ class Adapter:
                         return copy.deepcopy(item['data'])
                     raise UpstreamError(503, {'error': 'waiting_for_upstream'})
             try:
-                data = self.transport('GET', path)
+                data = self.request_remote('GET', path)
                 if not self.valid(path, data):
                     raise UpstreamError(502, {'error': 'invalid_upstream_schema'})
                 with self.lock:
@@ -239,61 +251,108 @@ class Adapter:
         for client in clients:
             client.append(message)
 
+    def request_remote(self, method, path, body=None):
+        direction = 'upload' if method == 'POST' and path == '/api/ingest' else 'download' if method == 'GET' else None
+        day = time.strftime('%Y-%m-%d', time.localtime())
+        if direction:
+            with self.lock:
+                record = self.metrics['sync_history'].setdefault(day, {})
+                counts = record.setdefault(direction, {'requests': 0, 'successes': 0, 'failures': 0})
+                counts['requests'] += 1
+        succeeded = False
+        try:
+            result = self.transport(method, path, body)
+            if direction == 'download' and not self.valid(path, result):
+                raise UpstreamError(502, {'error': 'invalid_upstream_schema'})
+            if direction == 'upload' and result.get('ok') is not True:
+                raise UpstreamError(502, {'error': 'invalid_ingest_ack'})
+            succeeded = True
+            return result
+        finally:
+            if direction:
+                with self.lock:
+                    counts['successes' if succeeded else 'failures'] += 1
+                    self.save()
+
     def ingest(self, payload):
         if not isinstance(payload, dict) or str(payload.get('deviceId', payload.get('id', ''))) != self.config['device_id']:
             raise UpstreamError(400, {'error': 'unexpected_device_id'})
+        with self.lock:
+            atomic_json(self.root / 'pending.json', payload)
+            self.pending_generation += 1
+            self.pending = copy.deepcopy(payload)
+            self.metrics['local_accepted_uploads'] += 1
+            self.save()
+        return {'ok': True, 'deviceId': self.config['device_id'], 'queued': True}
+
+    def upload_pending(self, manual=False):
         with self.upload_lock:
             with self.lock:
-                self.pending_generation += 1
-                self.pending = payload
-                atomic_json(self.root / 'pending.json', payload)
-            return self._post_pending()
-
-    def _post_pending(self):
-            with self.lock:
+                now = time.time()
+                schedule = self.metrics['upload_schedule']
+                if self.pending is None: return 'no_data'
+                if now < self.upload_retry_at: return 'backoff'
+                if not manual and not self.upload_retry_at and now < schedule['next_at']: return 'waiting'
+                payload = copy.deepcopy(self.pending)
+                generation = self.pending_generation
                 self.upload_in_progress = True
-            payload = self.pending
+                schedule['last_attempt_at'] = now
+                schedule['next_at'] = now + self.upload_interval
+                self.save()
             try:
-                response = self.transport('POST', '/api/ingest', payload)
-                if response.get('ok') is not True:
-                    raise UpstreamError(502, {'error': 'invalid_ingest_ack'})
+                self.request_remote('POST', '/api/ingest', payload)
                 with self.lock:
-                    self.pending = None
-                    atomic_json(self.root / 'pending.json', None)
+                    if self.pending_generation == generation:
+                        atomic_json(self.root / 'pending.json', None)
+                        self.pending = None
                     self.metrics['last_upload_at'] = time.time()
                     self.metrics['last_upload_device_id'] = self.config['device_id']
                     self.upload_failures = 0
                     self.upload_retry_at = 0
                     self.metrics['last_upload_error'] = None
-                    self.save()
-                return response
+                return 'success'
             except UpstreamError as error:
                 with self.lock:
                     self.upload_failures += 1
-                    self.metrics['last_upload_error'] = {'status': error.status, 'error': error.body.get('error', 'upstream_unavailable')}
+                    safe_errors = {'invalid_ingest_ack', 'upstream_connection_failed', 'credential_unavailable', 'upstream_unavailable'}
+                    reason = error.body.get('error')
+                    self.metrics['last_upload_error'] = {'status': error.status, 'error': reason if reason in safe_errors else 'upstream_rejected'}
                     self.upload_retry_at = time.time() + min(600, 60 * 2 ** min(self.upload_failures - 1, 4))
-                    self.save()
-                raise
+                return 'failed'
             finally:
                 with self.lock:
                     self.upload_in_progress = False
+                    schedule['retry_at'] = self.upload_retry_at
+                    schedule['failures'] = self.upload_failures
+                    self.save()
 
     def retry_upload(self):
+        return self.upload_pending()
+
+    def manual_sync(self):
         with self.upload_lock:
-          if self.pending is not None:
-            try:
-                self._post_pending()
-            except UpstreamError:
-                pass
+            with self.lock:
+                now = time.time()
+                if now - self.metrics.get('last_manual_at', 0) < 60: return
+                self.metrics['last_manual_at'] = now
+                self.save()
+        upload = self.upload_pending(manual=True)
+        try:
+            self.refresh(manual=True)
+            download = 'failed' if self.failures.get('/api/stats') else 'success_or_cached'
+        except UpstreamError:
+            download = 'failed'
+        with self.lock:
+            self.metrics['manual_result'] = {'upload': upload, 'download': download}
+            self.save()
 
     def scheduler(self):
         while not self.stop.is_set():
+            self.upload_pending()
             try:
                 self.refresh()
             except UpstreamError:
                 pass
-            if self.pending and time.time() >= self.upload_retry_at:
-                self.retry_upload()
             self.stop.wait(5)
 
 class Server(ThreadingHTTPServer):
@@ -350,7 +409,7 @@ class Handler(BaseHTTPRequestHandler):
                 allowed = {f'http://127.0.0.1:{adapter.local_port}', f'http://localhost:{adapter.local_port}'}
                 if origin not in allowed or self.headers.get('X-Adapter-Action') != 'refresh':
                     return self.reply(403, {'error': 'same_origin_required'})
-                adapter.refresh(manual=True)
+                adapter.manual_sync()
                 return self.reply(200, adapter.status())
             if method == 'GET' and path == '/api/health':
                 health = adapter.refresh('/api/health')

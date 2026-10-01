@@ -16,7 +16,7 @@ import urllib.request
 from adapter import Adapter,Server,Handler,atomic_json
 import settings
 
-VERSION='0.1.4'
+VERSION='0.1.5'
 K=C.WinDLL('kernel32',use_last_error=True)
 K.CreateEventW.argtypes=[W.LPVOID,W.BOOL,W.BOOL,W.LPCWSTR]; K.CreateEventW.restype=W.HANDLE
 K.CreateMutexW.argtypes=[W.LPVOID,W.BOOL,W.LPCWSTR]; K.CreateMutexW.restype=W.HANDLE
@@ -51,10 +51,14 @@ def worker(root):
     def watch():
         K.WaitForSingleObject(stop,0xffffffff); a.stop.set(); server.shutdown()
     threading.Thread(target=watch,daemon=True).start()
-    if cfg['upstream']: threading.Thread(target=a.scheduler,daemon=True).start()
+    scheduler=threading.Thread(target=a.scheduler,daemon=True) if cfg['upstream'] else None
+    if scheduler: scheduler.start()
     atomic_json(Path(root)/'process.json',{'pid':os.getpid(),'version':VERSION,'started_at':time.time()})
     try: server.serve_forever(poll_interval=.3)
-    finally: a.stop.set(); a.save(); server.server_close(); K.CloseHandle(stop)
+    finally:
+        a.stop.set()
+        if scheduler: scheduler.join(timeout=15)
+        a.save(); server.server_close(); K.CloseHandle(stop)
 
 class Host:
     def __init__(self,root):
@@ -129,7 +133,8 @@ def self_test(root):
         a=Adapter(cfg,tmp,transport=remote,secret_provider=lambda:'synthetic')
         a.refresh(); a.refresh(); assert calls==['/api/stats']
         blob=settings.protect(b'synthetic'); assert settings.protect(blob,True)==b'synthetic'
-        a.ingest({'deviceId':'Synthetic Desktop','today':{'totalTokens':42}}); assert a.pending is None
+        a.ingest({'deviceId':'Synthetic Desktop','today':{'totalTokens':42}}); assert a.pending is not None
+        a.upload_pending(manual=True); assert a.pending is None
         assert (assets()/'dashboard.html').exists()
     atomic_json(Path(root)/'self-test-result.json',{'ok':True,'version':VERSION,'frozen':bool(getattr(sys,'frozen',False))})
 

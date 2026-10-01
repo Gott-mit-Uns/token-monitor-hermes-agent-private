@@ -105,13 +105,16 @@ class Tests(unittest.TestCase):
         self.assertEqual(a2.metrics['upstream']['GET /api/stats']['download_body_bytes'], 123456)
     def test_upload_failure_queue_latest_recovery(self):
         self.down = True
-        for tokens in [1, 2]:
-            with self.assertRaises(UpstreamError): self.a.ingest({'deviceId': 'Synthetic Desktop', 'today': {'totalTokens': tokens}})
+        for tokens in [1, 2]: self.a.ingest({'deviceId': 'Synthetic Desktop', 'today': {'totalTokens': tokens}})
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.a.upload_pending(manual=True), 'failed')
         self.assertEqual(self.a.pending['today']['totalTokens'], 2)
-        self.down = False; self.a.retry_upload()
+        self.down = False
+        self.assertEqual(self.a.upload_pending(manual=True), 'backoff')
+        self.a.upload_retry_at = 0
+        self.assertEqual(self.a.upload_pending(manual=True), 'success')
         self.assertIsNone(self.a.pending)
         self.assertEqual(self.calls[-1][2]['today']['totalTokens'], 2)
-        self.assertEqual(self.a.metrics['last_upload_device_id'], 'Synthetic Desktop')
     def test_no_other_device_ingest(self):
         with self.assertRaises(UpstreamError): self.a.ingest({'deviceId': 'NAS1'})
         self.assertEqual(self.calls, [])
@@ -123,31 +126,24 @@ class Tests(unittest.TestCase):
         self.assertFalse(a.authorized({'Authorization': 'Bearer synthetic-remote-key'}))
     def test_old_success_cannot_clear_new_failed_upload(self):
         entered, release = threading.Event(), threading.Event()
-        errors = []
         def transport(method, path, body):
-            self.calls.append(copy.deepcopy(body))
             if body['sequence'] == 1:
-                entered.set()
-                self.assertTrue(release.wait(3))
-                return {'ok': True}
-            raise UpstreamError(502, {'error': 'synthetic_failure'})
+                entered.set(); self.assertTrue(release.wait(3)); return {'ok': True}
+            raise UpstreamError(502)
         self.a.transport = transport
-        def submit(n):
-            try: self.a.ingest({'deviceId': 'Synthetic Desktop', 'sequence': n})
-            except UpstreamError: errors.append(n)
-        old = threading.Thread(target=submit, args=(1,))
-        new = threading.Thread(target=submit, args=(2,))
-        old.start(); self.assertTrue(entered.wait(3)); new.start()
-        time.sleep(.1)
-        self.assertEqual(self.a.pending['sequence'], 1)
-        release.set(); old.join(3); new.join(3)
-        self.assertEqual(errors, [2])
+        self.a.ingest({'deviceId': 'Synthetic Desktop', 'sequence': 1})
+        old = threading.Thread(target=lambda:self.a.upload_pending(manual=True))
+        old.start(); self.assertTrue(entered.wait(3))
+        self.a.ingest({'deviceId': 'Synthetic Desktop', 'sequence': 2})
         self.assertEqual(self.a.pending['sequence'], 2)
-        persisted = json.loads(Path(self.temp.name, 'pending.json').read_text())
-        self.assertEqual(persisted['sequence'], 2)
-        resumed = Adapter(self.config, self.temp.name, transport=lambda *args: {'ok': True}, secret_provider=lambda: 'x')
+        release.set(); old.join(3)
+        self.assertEqual(self.a.pending['sequence'], 2)
+        self.assertEqual(self.a.upload_pending(manual=True), 'failed')
+        resumed = Adapter(self.config, self.temp.name, transport=lambda *args:{'ok':True})
         self.assertEqual(resumed.pending['sequence'], 2)
-        resumed.retry_upload()
+        self.assertEqual(resumed.upload_pending(manual=True), 'backoff')
+        resumed.upload_retry_at = 0
+        resumed.upload_pending(manual=True)
         self.assertIsNone(resumed.pending)
     def test_http_auth_routes_and_details(self):
         self.start_http()
@@ -190,6 +186,71 @@ class Tests(unittest.TestCase):
         self.start_http()
         self.assertEqual(self.request('/adapter/refresh', method='POST', auth=False)[0], 403)
         self.assertEqual(self.request('/adapter/refresh', method='POST', auth=False, extra={'Origin': f'http://127.0.0.1:{self.a.local_port}', 'X-Adapter-Action': 'refresh'})[0], 200)
+    def test_all_upload_periods_and_restart_deadline(self):
+        for period in [60, 300, 600, 900, 1800]:
+            with tempfile.TemporaryDirectory() as root, patch('adapter.time.time', return_value=10000):
+                calls = []
+                cfg = {**self.config, 'upload_interval_ms': period*1000}
+                a = Adapter(cfg, root, transport=lambda *args: calls.append(args) or {'ok':True})
+                target = a.status()['next_upload_at']
+                for n in range(5): a.ingest({'deviceId':'Synthetic Desktop', 'sequence':n})
+                self.assertEqual(a.status()['next_upload_at'], target)
+                self.assertEqual(a.upload_pending(), 'waiting')
+                self.assertEqual(calls, [])
+                resumed = Adapter(cfg, root, transport=a.transport)
+                self.assertEqual(resumed.status()['next_upload_at'], target)
+                with patch('adapter.time.time', return_value=10000+period):
+                    self.assertEqual(resumed.upload_pending(), 'success')
+                    self.assertEqual(calls[0][2]['sequence'], 4)
+                    self.assertEqual(resumed.upload_pending(), 'no_data')
+
+    def test_changed_period_uses_last_attempt_and_history_survives(self):
+        self.a.ingest({'deviceId':'Synthetic Desktop'})
+        self.a.upload_pending(manual=True)
+        changed = Adapter({**self.config,'upload_interval_ms':60000}, self.temp.name)
+        self.assertEqual(changed.status()['next_upload_at'], changed.metrics['upload_schedule']['last_attempt_at']+60)
+        counts = changed.status()['sync_history'][0]['upload']
+        self.assertEqual(counts, {'requests':1,'successes':1,'failures':0})
+
+    def test_manual_order_backoff_coalescing_and_invalid_ack(self):
+        self.a.ingest({'deviceId':'Synthetic Desktop'})
+        self.a.manual_sync()
+        self.assertEqual([x[0] for x in self.calls], ['POST','GET'])
+        self.a.manual_sync()
+        self.assertEqual(len(self.calls), 2)
+        self.a.ingest({'deviceId':'Synthetic Desktop'})
+        self.a.transport = lambda *args: {'ok':False}
+        self.assertEqual(self.a.upload_pending(manual=True), 'failed')
+        self.assertIsNotNone(self.a.pending)
+        self.assertEqual(self.a.upload_pending(), 'backoff')
+        row = self.a.status()['sync_history'][0]
+        self.assertEqual(row['upload'], {'requests':2,'successes':1,'failures':1})
+        self.assertEqual(row['download']['requests'], 1)
+
+    def test_history_day_is_request_start_not_completion(self):
+        with patch('adapter.time.strftime', return_value='2026-10-01') as day:
+            def transport(*args):
+                day.return_value='2026-10-02'
+                return STATS
+            self.a.transport=transport
+            self.a.refresh()
+        row=self.a.status()['sync_history'][0]
+        self.assertEqual(row['date'], '2026-10-01')
+        self.assertEqual(row['download'], {'requests':1,'successes':1,'failures':0})
+    def test_failed_manual_upload_still_downloads_and_restores_backoff(self):
+        def transport(method,path,body=None):
+            self.calls.append((method,path))
+            if method=='POST': raise UpstreamError(503)
+            return STATS
+        self.a.transport=transport
+        self.a.ingest({'deviceId':'Synthetic Desktop'})
+        self.a.manual_sync()
+        self.assertEqual([x[0] for x in self.calls],['POST','GET'])
+        self.assertEqual(self.a.status()['manual_result']['upload'],'failed')
+        resumed=Adapter(self.config,self.temp.name,transport=transport)
+        self.assertEqual(resumed.upload_pending(),'backoff')
+        self.assertEqual(resumed.status()['upload_retry_at'],self.a.status()['upload_retry_at'])
+
     def test_wire_gzip_count_and_minimal_header(self):
         class Response:
             status = 200
@@ -236,13 +297,15 @@ class Tests(unittest.TestCase):
             self.assertEqual(self.a.status()['upload_phase'], 'uploading')
             raise UpstreamError(502, {'error': 'synthetic_failure'})
         self.a.transport = transport
-        with self.assertRaises(UpstreamError):
-            self.a.ingest({'deviceId': 'Synthetic Desktop'})
+        self.a.ingest({'deviceId': 'Synthetic Desktop'})
+        self.assertEqual(self.a.status()['upload_phase'], 'queued')
+        self.assertEqual(self.a.upload_pending(manual=True), 'failed')
         self.assertEqual(self.a.status()['upload_phase'], 'retry')
         self.assertGreater(self.a.status()['upload_retry_at'], time.time())
         loaded = Adapter(self.config, self.temp.name, transport=lambda *args: {'ok': True})
         self.assertEqual(loaded.status()['upload_phase'], 'retry')
-        loaded.retry_upload()
+        loaded.upload_retry_at = 0
+        loaded.upload_pending(manual=True)
         self.assertEqual(loaded.status()['upload_phase'], 'idle')
         self.assertEqual(loaded.status()['upload_retry_at'], 0)
 
