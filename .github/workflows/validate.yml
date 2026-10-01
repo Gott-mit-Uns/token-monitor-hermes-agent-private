@@ -4,6 +4,8 @@ on:
     branches: [main]
     paths-ignore:
       - '**/*.md'
+      - 'windows-adapter/**'
+      - '.github/workflows/windows-adapter.yml'
   workflow_dispatch:
 permissions:
   contents: read

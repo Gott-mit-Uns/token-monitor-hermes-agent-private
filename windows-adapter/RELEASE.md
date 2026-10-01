@@ -1,0 +1,9 @@
+Windows x64 单文件 EXE，包含 Python 运行时；窗口需要 Microsoft Edge WebView2 Runtime。
+
+下载 TokenMonitorAdapter.exe 后运行，在设置页填写 HTTPS Hub 地址及同步密钥。默认每 10 分钟压缩下载、每 30 分钟由原 Token Monitor 客户端上报。勾选“接入 Token Monitor”会备份并修改客户端配置，需要重启原客户端。
+
+支持明暗主题、系统托盘、当前用户登录启动、手动同步、流量计量及本地 SSE。关闭窗口继续后台运行，托盘“退出”停止同步。
+
+数据存放于当前用户 LocalAppData，远端密钥用 Windows DPAPI 加密。发布物不含任何真实服务器配置、凭据或用量。升级时退出旧版本后替换 EXE；开启自启动会复制 EXE 到固定用户程序目录。
+
+首版不自动更新、不发送遥测，暂不进行商业代码签名。正文流量不含 TLS、HTTP 头或 TCP 重传。累计失败不是当前故障；待上报仅保留最新快照，并非逐条消息队列。
