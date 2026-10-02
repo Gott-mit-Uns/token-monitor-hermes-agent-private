@@ -2,6 +2,8 @@
 
 基于 [Token Monitor 官方项目](https://github.com/Javis603/token-monitor) 的 NAS Docker Agent，采集 Hermes 用量并同步到自己配置的桌面 Hub。当前官方源码基线是 `v0.63.1`，NAS 发布版本是 `v0.63.1-01`。官方提交及源码范围见 [UPSTREAM.md](UPSTREAM.md)。
 
+Windows EXE Adapter 已迁移到独立公开仓库 [token-monitor-adapter](https://github.com/Gott-mit-Uns/token-monitor-adapter)，包括源码、Windows 构建工作流与历史 `adapter-v*` Release。本仓库只维护 NAS Docker Agent；Adapter 更新与下载请使用新仓库。
+
 ## 镜像、版本与更新
 
 镜像继续使用现有公开的 GHCR 包名，以免已有 NAS 部署的拉取地址失效：

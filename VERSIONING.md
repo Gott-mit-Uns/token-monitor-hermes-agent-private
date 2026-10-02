@@ -11,3 +11,5 @@ NAS 镜像和 GitHub Release 使用同一个版本号：`v<官方版本>-<两位
 - 早期 `0.54.1` 等旧标签是历史版本，保留回退用途，不沿用其编号规则。
 
 源码升级时保留 NAS 专用 Docker、健康检查、超时、去重、权限和持久化边界；先在状态副本上验证归档迁移。GitHub 发布不会自动更新 NAS 容器。
+
+Windows Adapter 使用独立仓库 `Gott-mit-Uns/token-monitor-adapter` 与 `adapter-v<版本>`。不要在本仓库提交 Adapter 源码或发布 Adapter EXE，也不要把 Adapter 的版本号用于 NAS 镜像。

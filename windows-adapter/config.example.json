@@ -1,7 +1,0 @@
-{
-  "upstream": "https://hub.example.com",
-  "port": 17322,
-  "interval_seconds": 600,
-  "upload_interval_ms": 1800000,
-  "theme": "system"
-}
