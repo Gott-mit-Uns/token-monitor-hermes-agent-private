@@ -52,7 +52,8 @@ def worker(root):
         while K.WaitForSingleObject(stop,1000)!=0 and not a.stop.is_set():
             if cfg['upstream']:
                 a.ensure_scheduler()
-                if time.monotonic()-a.heartbeat_monotonic>120: break
+                request_age=max((time.monotonic()-r['monotonic'] for r in list(a.active_requests.values())),default=0)
+                if max(time.monotonic()-a.heartbeat_monotonic,request_age)>120: break
         a.stop.set(); server.shutdown()
     if cfg['upstream']: a.ensure_scheduler()
     threading.Thread(target=watch,daemon=True).start()
@@ -72,7 +73,7 @@ class Host:
         self.root=root; self.child=None; self.ui=None; self.ui_job=None; self.quitting=False; self.lock=threading.RLock()
         self.worker_stop=event(root,'worker-stop',True); self.open_event=event(root,'show'); self.quit_event=event(root,'quit')
         self.ui_stop=event(root,'ui-stop',True);self.ui_show=event(root,'ui-show')
-        self.restart_index=0;self.restart_at=0;self.child_started=0;self.stopping_at=None
+        self.restart_index=0;self.restart_at=0;self.child_started=0;self.stopping_at=None;self.probe_failed_since=None
         self.recovery={'restarts':0,'phase':'running','message':None}
         self.pipe_name=r'\\.\pipe\TokenMonitorAdapter-'+uuid.uuid4().hex
         self.bridge=Bridge(self)
@@ -90,7 +91,7 @@ class Host:
     def spawn(self):
         K.ResetEvent(self.worker_stop)
         self.child=subprocess.Popen(command()+['--worker','--root',str(self.root)],creationflags=subprocess.CREATE_NO_WINDOW)
-        self.child_started=time.monotonic(); self.stopping_at=None
+        self.child_started=time.monotonic(); self.stopping_at=None; self.probe_failed_since=None
         self.record_recovery(phase='running',message=None)
     def stop_worker(self):
         if self.child and self.child.poll() is None:
@@ -122,10 +123,8 @@ class Host:
                         last_probe=now
                         try:
                             health=status(self.root).get('scheduler',{})
-                            if health.get('stalled') and health.get('heartbeat_age_seconds',0)>120 and self.stopping_at is None:
-                                self.stopping_at=now;K.SetEvent(self.worker_stop)
-                                self.record_recovery(phase='stopping',message='调度停滞，正在停止后台')
-                        except Exception: pass
+                            self.check_worker_health(now,health)
+                        except Exception: self.check_worker_health(now,None)
                 elif self.child:
                     if not self.restart_at:
                         delay=(2,5,10,30,60)[min(self.restart_index,4)]
@@ -133,6 +132,16 @@ class Host:
                         self.record_recovery(phase='backoff',message='后台已退出，等待恢复',restarts=self.recovery['restarts']+1)
                     if now>=self.restart_at and not self.quitting:
                         self.restart_at=0;self.spawn()
+    def check_worker_health(self,now,health):
+        if health is None:
+            if self.probe_failed_since is None:self.probe_failed_since=now
+            stalled=now-self.probe_failed_since>120
+        else:
+            self.probe_failed_since=None
+            stalled=health.get('stalled') and max(health.get('heartbeat_age_seconds',0),health.get('request_max_age_seconds',0))>120
+        if stalled and self.stopping_at is None:
+            self.stopping_at=now;K.SetEvent(self.worker_stop)
+            self.record_recovery(phase='stopping',message='后台无进展，正在停止并恢复')
     def show(self):
         from local_ipc import UiJob
         with self.lock:

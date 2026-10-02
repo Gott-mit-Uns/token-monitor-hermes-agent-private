@@ -51,4 +51,11 @@ jobs:
           path: release
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" release/TokenMonitorAdapter.exe release/SHA256SUMS.txt --draft --title "Token Monitor Adapter $GITHUB_REF_NAME" --notes-file windows-adapter/RELEASE.md
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --json isDraft > /tmp/adapter-release.json 2>/dev/null; then
+            jq -e '.isDraft == true' /tmp/adapter-release.json
+            gh release upload "$GITHUB_REF_NAME" release/TokenMonitorAdapter.exe release/SHA256SUMS.txt --clobber
+            gh release edit "$GITHUB_REF_NAME" --notes-file windows-adapter/RELEASE.md
+          else
+            gh release create "$GITHUB_REF_NAME" release/TokenMonitorAdapter.exe release/SHA256SUMS.txt --draft --title "Token Monitor Adapter $GITHUB_REF_NAME" --notes-file windows-adapter/RELEASE.md
+          fi

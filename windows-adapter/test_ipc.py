@@ -51,4 +51,3 @@ class IpcTests(unittest.TestCase):
         self.assertEqual(child.returncode,0)
 
 if __name__=='__main__':unittest.main()
-

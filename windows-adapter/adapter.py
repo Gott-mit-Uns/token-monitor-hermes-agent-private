@@ -39,6 +39,7 @@ class Adapter:
         self.config, self.root = config, Path(root)
         self.version = version
         self.upload_in_progress = False
+        self.active_requests = {}
         self.cache_dirty = False
         self.pending_dirty = False
         self.storage_failures = set()
@@ -156,6 +157,8 @@ class Adapter:
             meter['requests'] += 1
             meter['upload_body_bytes'] += len(data or b'')
             self.record_daily(upload=len(data or b''))
+        request_id=threading.get_ident()
+        with self.lock:self.active_requests[request_id]={'monotonic':time.monotonic()}
         try:
             connection.request(method, base.path.rstrip('/') + path, data, headers)
             response = connection.getresponse()
@@ -190,6 +193,7 @@ class Adapter:
             raise UpstreamError(502, {'error': 'upstream_connection_failed'}) from None
         finally:
             connection.close()
+            with self.lock:self.active_requests.pop(request_id,None)
 
     @staticmethod
     def valid(path, data):
@@ -234,7 +238,8 @@ class Adapter:
             upload_failed = self.pending is not None and bool(self.upload_retry_at)
             labels = {'waiting': '等待首次同步', 'offline_cached': '下载失败，使用缓存', 'stale': '缓存已过期'}
             label = labels.get(state, '上报失败，等待重试' if upload_failed else '同步正常')
-            stalled = time.monotonic() - self.heartbeat_monotonic > 60 and self.scheduler_thread is not None
+            request_age=max((time.monotonic()-r['monotonic'] for r in self.active_requests.values()),default=0)
+            stalled = (time.monotonic() - self.heartbeat_monotonic > 60 and self.scheduler_thread is not None) or request_age>60
             scheduler_bad = stalled or bool(self.scheduler_health['error_category'])
             if self.storage_failures: label = '本地保存失败'
             elif scheduler_bad: label = '调度停滞' if stalled else self.scheduler_health['message']
@@ -250,7 +255,7 @@ class Adapter:
                     'pending_upload': self.pending is not None, 'metrics': metrics,
                     'pending_tokens': self.pending_token_summary(),
                     'storage': {'ok': not self.storage_failures, 'message': '本地保存失败' if self.storage_failures else None},
-                    'scheduler': {**copy.deepcopy(self.scheduler_health), 'stalled': stalled, 'heartbeat_age_seconds': round(time.monotonic() - self.heartbeat_monotonic, 1)},
+                    'scheduler': {**copy.deepcopy(self.scheduler_health), 'stalled': stalled, 'request_max_age_seconds': round(request_age,1), 'heartbeat_age_seconds': round(time.monotonic() - self.heartbeat_monotonic, 1)},
                     'upload_progress_started_at': self.metrics['upload_schedule'].get('last_attempt_at', self.metrics['upload_schedule']['next_at'] - self.upload_interval),
                     'version': self.version, 'upload_retry_at': self.upload_retry_at,
                     'upload_phase': ('uploading' if self.upload_in_progress else ('retry' if self.upload_retry_at else 'queued') if self.pending is not None

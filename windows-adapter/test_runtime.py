@@ -114,6 +114,25 @@ class PersistenceTests(unittest.TestCase):
         self.a.save();restored=Adapter(self.cfg,self.temp.name)
         self.assertEqual(restored.pending_token_summary()['value'],0)
         self.assertEqual(restored.metrics['token_baseline']['total_tokens'],17)
+    def test_request_stall_warns_even_while_scheduler_is_healthy(self):
+        self.a.active_requests[1]={'monotonic':time.monotonic()-61}
+        self.assertTrue(self.a.status()['scheduler']['stalled'])
+        self.assertEqual(self.a.status()['health_level'],'warning')
+        self.a.active_requests.clear();self.assertFalse(self.a.status()['scheduler']['stalled'])
+    def test_parent_recovers_when_status_interface_is_unavailable(self):
+        from desktop import Host
+        from unittest.mock import Mock
+        host=Host.__new__(Host);host.probe_failed_since=None;host.stopping_at=None;host.worker_stop=0;host.record_recovery=Mock()
+        with patch('desktop.K.SetEvent') as stop:
+            host.check_worker_health(10,None);host.check_worker_health(130,None);stop.assert_not_called()
+            host.check_worker_health(131,None);stop.assert_called_once();self.assertEqual(host.stopping_at,131)
+            host.check_worker_health(200,None);stop.assert_called_once()
+    def test_parent_healthy_probe_resets_failure_window(self):
+        from desktop import Host
+        from unittest.mock import Mock
+        host=Host.__new__(Host);host.probe_failed_since=10;host.stopping_at=None;host.worker_stop=0;host.record_recovery=Mock()
+        host.check_worker_health(129,{'stalled':False});self.assertIsNone(host.probe_failed_since)
+        host.check_worker_health(200,None);self.assertEqual(host.probe_failed_since,200);self.assertIsNone(host.stopping_at)
     def test_local_http_failure_is_503(self):
         import http.client
         server=adapter.Server(('127.0.0.1',0),adapter.Handler);server.adapter=self.a;self.a.local_port=server.server_port
