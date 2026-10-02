@@ -31,11 +31,22 @@ class UpstreamError(Exception):
         self.status = status
         self.body = body or {'error': 'upstream_unavailable'}
 
+class StorageError(Exception):
+    pass
+
 class Adapter:
     def __init__(self, config, root, transport=None, secret_provider=None, local_secret_provider=None, version='development'):
         self.config, self.root = config, Path(root)
         self.version = version
         self.upload_in_progress = False
+        self.cache_dirty = False
+        self.pending_dirty = False
+        self.storage_failures = set()
+        self.scheduler_health = {'stage': 'starting', 'heartbeat_at': time.time(), 'consecutive_errors': 0,
+                                 'error_category': None, 'message': None, 'restarts': 0}
+        self.heartbeat_monotonic = time.monotonic()
+        self.scheduler_thread = None
+        self.scheduler_guard = threading.Lock()
         self.root.mkdir(parents=True, exist_ok=True)
         self.interval = config.get('interval_seconds', 600)
         self.transport = transport or self.http_request
@@ -64,7 +75,22 @@ class Adapter:
         schedule['interval'] = self.upload_interval
         self.upload_retry_at = schedule.get('retry_at', 0)
         self.upload_failures = schedule.get('failures', 0)
-        self.save()
+        self.deadlines = {}
+        self.deadline_due('upload', schedule['next_at'])
+        if self.upload_retry_at: self.deadline_due('upload-retry', self.upload_retry_at)
+        for path,item in self.cache.items():
+            self.deadline_due('read:'+path+':normal', item['at']+self.interval)
+            self.deadline_due('read:'+path+':manual', item['at']+60)
+        try: self.save()
+        except StorageError: pass
+
+    def deadline_due(self, key, target):
+        # Persist wall dates; use monotonic deadlines during this process lifetime.
+        current = self.deadlines.get(key)
+        if current is None or current[0] != target:
+            current = (target, time.monotonic() + max(0, target - time.time()))
+            self.deadlines[key] = current
+        return time.monotonic() >= current[1]
 
     def _load(self):
         try:
@@ -148,7 +174,7 @@ class Adapter:
             parsed = json.loads(decoded) if decoded else {}
             if not 200 <= response.status < 300:
                 # Do not echo arbitrary upstream errors (which could contain secrets).
-                error = {'error': str(parsed.get('error', 'upstream_rejected'))[:80]}
+                error = {'error': 'upstream_rejected'}
                 if response.status == 409 and path == '/api/subscriptions':
                     error = parsed
                 raise UpstreamError(response.status, error)
@@ -164,7 +190,6 @@ class Adapter:
             raise UpstreamError(502, {'error': 'upstream_connection_failed'}) from None
         finally:
             connection.close()
-            self.save()
 
     @staticmethod
     def valid(path, data):
@@ -178,10 +203,28 @@ class Adapter:
             return data.get('role') == 'hub'
         return True
 
-    def save(self):
+    def _persist(self, name, value):
+        try:
+            atomic_json(self.root / name, value)
+        except OSError:
+            self.storage_failures.add(name)
+            raise StorageError('local_save_failed') from None
+        self.storage_failures.discard(name)
+
+    def save_cache(self):
         with self.lock:
-            atomic_json(self.root / 'cache.json', {'upstream': self.config['upstream'], 'entries': self.cache})
-            atomic_json(self.root / 'metrics.json', self.metrics)
+            if self.cache_dirty:
+                self._persist('cache.json', {'upstream': self.config['upstream'], 'entries': self.cache})
+                self.cache_dirty = False
+
+    def save(self):
+        # Compatibility entry point: only dirty cache/pending and current runtime state.
+        with self.lock:
+            if self.pending_dirty:
+                self._persist('pending.json', self.pending)
+                self.pending_dirty = False
+            self.save_cache()
+            self._persist('metrics.json', self.metrics)
 
     def status(self):
         with self.lock:
@@ -191,15 +234,23 @@ class Adapter:
             upload_failed = self.pending is not None and bool(self.upload_retry_at)
             labels = {'waiting': '等待首次同步', 'offline_cached': '下载失败，使用缓存', 'stale': '缓存已过期'}
             label = labels.get(state, '上报失败，等待重试' if upload_failed else '同步正常')
+            stalled = time.monotonic() - self.heartbeat_monotonic > 60 and self.scheduler_thread is not None
+            scheduler_bad = stalled or bool(self.scheduler_health['error_category'])
+            if self.storage_failures: label = '本地保存失败'
+            elif scheduler_bad: label = '调度停滞' if stalled else self.scheduler_health['message']
             metrics = copy.deepcopy(self.metrics)
             metrics.pop('token_baseline', None)
-            return {'adapter': 'Token Monitor Hotspot Cache', 'interval_seconds': self.interval,
+            try: recovery = json.loads((self.root/'recovery.json').read_text(encoding='utf-8'))
+            except (OSError,ValueError): recovery = {}
+            return {'recovery': recovery, 'adapter': 'Token Monitor Hotspot Cache', 'interval_seconds': self.interval,
                     'last_success_at': at, 'cache_age_seconds': round(age, 1) if age is not None else None,
-                    'state': state, 'health_level': 'ok' if state == 'cached' and not upload_failed else 'warning', 'health_label': label,
+                    'state': state, 'health_level': 'ok' if state == 'cached' and not upload_failed and not self.storage_failures and not scheduler_bad else 'warning', 'health_label': label,
                     'next_attempt_at': self.next_retry.get('/api/stats'), 'last_error': self.last_error,
                     'device_count': len(self.cache.get('/api/stats', {}).get('data', {}).get('devices', [])),
                     'pending_upload': self.pending is not None, 'metrics': metrics,
                     'pending_tokens': self.pending_token_summary(),
+                    'storage': {'ok': not self.storage_failures, 'message': '本地保存失败' if self.storage_failures else None},
+                    'scheduler': {**copy.deepcopy(self.scheduler_health), 'stalled': stalled, 'heartbeat_age_seconds': round(time.monotonic() - self.heartbeat_monotonic, 1)},
                     'upload_progress_started_at': self.metrics['upload_schedule'].get('last_attempt_at', self.metrics['upload_schedule']['next_at'] - self.upload_interval),
                     'version': self.version, 'upload_retry_at': self.upload_retry_at,
                     'upload_phase': ('uploading' if self.upload_in_progress else ('retry' if self.upload_retry_at else 'queued') if self.pending is not None
@@ -246,8 +297,9 @@ class Adapter:
             with self.lock:
                 item = self.cache.get(path)
                 minimum_age = 60 if manual else self.interval
-                due = not item or now - item['at'] >= minimum_age
-                if not due or now < self.next_retry.get(path, 0):
+                due = not item or self.deadline_due('read:'+path+(':'+ 'manual' if manual else ':normal'), item['at']+minimum_age)
+                retry = self.next_retry.get(path, 0)
+                if not due or (retry and not self.deadline_due('read-retry:'+path,retry)):
                     if item:
                         self.metrics['local']['cache_hits'] = self.metrics['local'].get('cache_hits', 0) + 1
                         return copy.deepcopy(item['data'])
@@ -258,6 +310,7 @@ class Adapter:
                     raise UpstreamError(502, {'error': 'invalid_upstream_schema'})
                 with self.lock:
                     self.cache[path] = {'at': time.time(), 'data': data}
+                    self.cache_dirty = True
                     self.failures[path] = 0
                     self.next_retry[path] = 0
                     if path == '/api/stats':
@@ -306,17 +359,19 @@ class Adapter:
             if direction:
                 with self.lock:
                     counts['successes' if succeeded else 'failures'] += 1
-                    self.save()
 
     def ingest(self, payload):
         if not isinstance(payload, dict) or str(payload.get('deviceId', payload.get('id', ''))) != self.config['device_id']:
             raise UpstreamError(400, {'error': 'unexpected_device_id'})
         with self.lock:
-            atomic_json(self.root / 'pending.json', payload)
             self.pending_generation += 1
             self.pending = copy.deepcopy(payload)
+            self.pending_dirty = True
             self.metrics['local_accepted_uploads'] += 1
-            self.save()
+            try: self.save()
+            except StorageError:
+                self.metrics['local_accepted_uploads'] -= 1
+                raise
         return {'ok': True, 'deviceId': self.config['device_id'], 'queued': True}
 
     def upload_pending(self, manual=False):
@@ -325,21 +380,25 @@ class Adapter:
                 now = time.time()
                 schedule = self.metrics['upload_schedule']
                 if self.pending is None: return 'no_data'
-                if now < self.upload_retry_at: return 'backoff'
-                if not manual and not self.upload_retry_at and now < schedule['next_at']: return 'waiting'
+                if self.upload_retry_at and not self.deadline_due('upload-retry',self.upload_retry_at): return 'backoff'
+                if not manual and not self.upload_retry_at and not self.deadline_due('upload',schedule['next_at']): return 'waiting'
                 payload = copy.deepcopy(self.pending)
                 generation = self.pending_generation
-                self.upload_in_progress = True
+                if self.storage_failures or self.pending_dirty or self.cache_dirty: self.save()
+                previous_schedule = copy.deepcopy(schedule)
                 schedule['last_attempt_at'] = now
                 schedule['next_at'] = now + self.upload_interval
-                self.save()
+                try: self.save()
+                except StorageError:
+                    schedule.clear();schedule.update(previous_schedule)
+                    raise
+                self.upload_in_progress = True
+            acknowledged = False
             try:
                 self.request_remote('POST', '/api/ingest', payload)
+                acknowledged = True
                 with self.lock:
                     self.metrics['token_baseline'] = self.token_summary(payload)
-                    if self.pending_generation == generation:
-                        atomic_json(self.root / 'pending.json', None)
-                        self.pending = None
                     self.metrics['last_upload_at'] = time.time()
                     self.metrics['last_upload_device_id'] = self.config['device_id']
                     self.upload_failures = 0
@@ -360,6 +419,11 @@ class Adapter:
                     schedule['retry_at'] = self.upload_retry_at
                     schedule['failures'] = self.upload_failures
                     self.save()
+                    if acknowledged and self.pending_generation == generation:
+                        self.pending_dirty = True
+                        self._persist('pending.json', None)
+                        self.pending = None
+                        self.pending_dirty = False
 
     def retry_upload(self):
         return self.upload_pending()
@@ -368,7 +432,8 @@ class Adapter:
         with self.upload_lock:
             with self.lock:
                 now = time.time()
-                if now - self.metrics.get('last_manual_at', 0) < 60: return
+                target = self.metrics.get('last_manual_at', 0) + 60
+                if not self.deadline_due('manual', target): return
                 self.metrics['last_manual_at'] = now
                 self.save()
         upload = self.upload_pending(manual=True)
@@ -381,15 +446,50 @@ class Adapter:
             self.metrics['manual_result'] = {'upload': upload, 'download': download}
             self.save()
 
+    def heartbeat(self, stage):
+        with self.lock:
+            self.heartbeat_monotonic = time.monotonic()
+            self.scheduler_health.update(stage=stage, heartbeat_at=time.time())
+
+    def scheduler_cycle(self):
+        self.heartbeat('storage')
+        if self.storage_failures or self.pending_dirty or self.cache_dirty: self.save()
+        self.heartbeat('upload')
+        result = self.upload_pending()
+        if self.stop.is_set(): return
+        self.heartbeat('download')
+        self.refresh()
+        self.heartbeat('idle')
+        network = result == 'failed' or bool(self.failures.get('/api/stats'))
+        with self.lock:
+            self.scheduler_health.update(consecutive_errors=0, error_category='network' if network else None,
+                                         message='远端请求失败，等待重试' if network else None)
+
     def scheduler(self):
         while not self.stop.is_set():
-            self.upload_pending()
-            if self.stop.is_set(): break
+            delay = 5
             try:
-                self.refresh()
-            except UpstreamError:
-                pass
-            self.stop.wait(5)
+                self.scheduler_cycle()
+            except Exception as error:
+                category = 'storage' if isinstance(error, StorageError) else 'network' if isinstance(error, UpstreamError) else 'internal'
+                with self.lock:
+                    n = self.scheduler_health['consecutive_errors'] + 1 if self.scheduler_health['error_category'] == category else 1
+                    self.scheduler_health.update(consecutive_errors=n, error_category=category,
+                        message={'storage':'本地保存失败', 'network':'远端请求失败，等待重试', 'internal':'调度内部异常，正在恢复'}[category])
+                if category == 'internal': delay = min(60, 5 * 2 ** min(n - 1, 4))
+            self.heartbeat('waiting')
+            self.stop.wait(delay)
+        self.heartbeat('stopped')
+
+    def ensure_scheduler(self):
+        with self.scheduler_guard:
+            if self.stop.is_set(): return
+            if self.scheduler_thread is None or not self.scheduler_thread.is_alive():
+                if self.scheduler_thread is not None: self.scheduler_health['restarts'] += 1
+                self.heartbeat('starting')
+                self.scheduler_thread = threading.Thread(target=self.scheduler, daemon=True)
+                self.scheduler_thread.start()
+
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
@@ -466,17 +566,25 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(payload, dict) or not isinstance(payload.get('subscriptions'), list) or not isinstance(payload.get('baseUpdatedAt', ''), str):
                     raise UpstreamError(400, {'error': 'invalid_subscriptions'})
                 with adapter.read_locks['/api/subscriptions']:
-                    data = adapter.transport('PUT', path, payload)
+                    try: data = adapter.transport('PUT', path, payload)
+                    except UpstreamError:
+                        adapter.save()
+                        raise
                     with adapter.lock:
                         adapter.cache[path] = {'at': time.time(), 'data': data}
+                        adapter.cache_dirty = True
                         adapter.save()
                 return self.reply(200, data)
             if method == 'DELETE' and path.startswith('/api/devices/'):
                 # Only the original client's own cleanup route is supported.
                 if unquote(path[len('/api/devices/'):]) != adapter.config['device_id']:
                     return self.reply(403, {'error': 'other_device_delete_disabled'})
-                return self.reply(200, adapter.transport('DELETE', path))
+                try: data = adapter.transport('DELETE', path)
+                finally: adapter.save()
+                return self.reply(200, data)
             return self.reply(405, {'error': 'unsupported_route'})
+        except StorageError:
+            return self.reply(503, {'error': 'local_save_failed'})
         except UpstreamError as error:
             return self.reply(error.status, error.body)
         except (BrokenPipeError, ConnectionResetError, socket.timeout):

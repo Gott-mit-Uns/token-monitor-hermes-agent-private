@@ -8,7 +8,7 @@
 
 默认压缩下载 10 分钟、远端上报 30 分钟。两个周期均由 Adapter 控制，支持 1/5/10/15/30 分钟。客户端实时向本机提交最新快照，持久化后确认接收；本地确认不表示远端已收到。勾选“接入 Token Monitor”会先备份配置，再将原客户端 Hub 地址设为本机地址并设为实时本地提交；需要重启原客户端使设置生效。取消勾选时不调整原客户端；Adapter 仍按自身周期发送已收到的新快照，客户端提交较慢时不能保证每周期都有新数据。
 
-关闭窗口隐藏到托盘。托盘可打开窗口、手动同步或退出整个适配器。重复运行 EXE 会打开已有窗口。开启登录启动后，EXE 被复制到 `%LOCALAPPDATA%\Programs\TokenMonitorAdapter`，以 `--background` 运行；关闭开关移除当前用户启动项。
+关闭窗口立即释放独立界面及其 WebView2 子进程，托盘和同步继续运行；最小化保留窗口。未保存设置关闭前会询问是否丢弃。托盘可打开窗口、手动同步或退出整个适配器。重复运行 EXE 会打开已有窗口。开启登录启动后，EXE 被复制到 `%LOCALAPPDATA%\Programs\TokenMonitorAdapter`，以 `--background` 运行；关闭开关移除当前用户启动项。
 
 配置与运行数据在 `%LOCALAPPDATA%\TokenMonitorHotspotAdapter`。升级时从托盘退出，替换 EXE 后重新运行；若使用登录启动，再保存设置以更新固定目录中的 EXE。移动原始下载文件不会破坏已设置的登录启动。
 
@@ -20,13 +20,21 @@
 
 远端凭据与本地客户端认证分离。密钥使用当前 Windows 用户 DPAPI 加密，不能复制到其他账号后解密。仅监听 127.0.0.1。设置桥接仅在内嵌窗口提供，普通浏览器不能修改设置。程序不自动更新、不发送遥测。
 
+## 后台恢复（0.1.7）
+
+缓存只在更新时保存；快照逐次原子保存，磁盘失败返回本地保存失败并保留最新内存数据，不误报网络故障。请求计量与结果合并保存，升级兼容原文件格式。
+
+同步线程记录心跳和阶段。内部异常按 5/10/20/40/60 秒退避，死线程在确认结束后重建。120 秒没有进展时停止后台，20 秒不能退出才终止旧进程；主进程按 2/5/10/30/60 秒重启，稳定五分钟后复位。重启可能幂等重传最新快照，不承诺跨文件严格一次发送。诊断区提供脱敏健康摘要。
+
+后台主进程不加载 WebView2；独立 UI 通过限当前用户、拒绝远程连接的命名管道读写设置，主进程核对已登记 UI 进程身份。仅提供读取设置、保存设置和退出应用三类调用，未增加 HTTP 设置接口。
+
 ## 构建与测试
 
 在 Windows x64 Python 3.12 独立环境执行：
 
 ```powershell
 python -m pip install -r requirements-build.txt
-python -m unittest test_adapter test_settings
+python -m unittest discover -p "test_*.py"
 python -m PyInstaller --clean --noconfirm TokenMonitorAdapter.spec
 .\dist\TokenMonitorAdapter.exe --self-test --root "$env:TEMP\adapter-smoke"
 ```

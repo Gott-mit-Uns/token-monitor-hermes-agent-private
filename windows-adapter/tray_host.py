@@ -10,7 +10,7 @@ import urllib.request
 import webbrowser
 
 
-def run(root, open_window, exit_app):
+def run(root, open_window, exit_app, quitting=lambda:False):
     config = json.loads((root / 'config.json').read_text(encoding='utf-8'))
     url = f"http://127.0.0.1:{config['port']}"
     user32 = C.WinDLL('user32', use_last_error=True)
@@ -95,8 +95,11 @@ def run(root, open_window, exit_app):
 
     def poll():
         while not stop.is_set():
+            if quitting():
+                user32.PostMessageW(icon.hWnd,0x10,0,0);return
             poll_once()
-            stop.wait(20)
+            for _ in range(40):
+                if stop.wait(.5) or quitting(): break
 
     @CALLBACK
     def wndproc(hwnd, message, wparam, lparam):

@@ -88,6 +88,7 @@ class Tests(unittest.TestCase):
     def test_stale_restart_and_resume_fetch_once(self):
         self.a.refresh()
         self.a.cache['/api/stats']['at'] -= 3600
+        self.a.cache_dirty = True
         self.a.save()
         resumed = Adapter(self.config, self.temp.name, transport=self.remote, secret_provider=lambda: 'x')
         for _ in range(10): resumed.refresh()
@@ -100,6 +101,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.a.status()['state'], 'offline_cached')
     def test_metrics_survive_restart(self):
         self.a.metrics['upstream']['GET /api/stats'] = {'requests': 8, 'download_body_bytes': 123456}
+        self.a.cache_dirty = True
         self.a.save()
         a2 = Adapter(self.config, self.temp.name, transport=self.remote, secret_provider=lambda: 'x')
         self.assertEqual(a2.metrics['upstream']['GET /api/stats']['download_body_bytes'], 123456)
@@ -188,7 +190,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.request('/adapter/refresh', method='POST', auth=False, extra={'Origin': f'http://127.0.0.1:{self.a.local_port}', 'X-Adapter-Action': 'refresh'})[0], 200)
     def test_all_upload_periods_and_restart_deadline(self):
         for period in [60, 300, 600, 900, 1800]:
-            with tempfile.TemporaryDirectory() as root, patch('adapter.time.time', return_value=10000):
+            with tempfile.TemporaryDirectory() as root, patch('adapter.time.time', return_value=10000), patch('adapter.time.monotonic', return_value=10000):
                 calls = []
                 cfg = {**self.config, 'upload_interval_ms': period*1000}
                 a = Adapter(cfg, root, transport=lambda *args: calls.append(args) or {'ok':True})
@@ -199,7 +201,7 @@ class Tests(unittest.TestCase):
                 self.assertEqual(calls, [])
                 resumed = Adapter(cfg, root, transport=a.transport)
                 self.assertEqual(resumed.status()['next_upload_at'], target)
-                with patch('adapter.time.time', return_value=10000+period):
+                with patch('adapter.time.time', return_value=10000+period), patch('adapter.time.monotonic', return_value=10000+period):
                     self.assertEqual(resumed.upload_pending(), 'success')
                     self.assertEqual(calls[0][2]['sequence'], 4)
                     self.assertEqual(resumed.upload_pending(), 'no_data')
