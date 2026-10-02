@@ -569,6 +569,19 @@ test('a worker module that fails to load falls back to watching in-process', asy
 });
 
 function watcherChildrenOf(ppid) {
+  // The NAS slim image omits ps; Linux exposes the same process evidence in procfs.
+  if (process.platform === 'linux') {
+    return fs.readdirSync('/proc').filter((name) => /^\d+$/.test(name)).filter((pid) => {
+      try {
+        const status = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
+        const command = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+        return Number(status.match(/^PPid:\s+(\d+)/m)?.[1]) === ppid && command.includes('watcherWorker.js');
+      } catch (error) {
+        if (['ENOENT', 'ESRCH', 'EACCES'].includes(error.code)) return false;
+        throw error;
+      }
+    }).map(Number);
+  }
   const { execFileSync } = require('node:child_process');
   return execFileSync('ps', ['-A', '-o', 'pid=,ppid=,command='], { encoding: 'utf8' })
     .split('\n')
