@@ -42,3 +42,7 @@ the Hub is offline. No automatic device deletion is enabled.
 ## v0.65.0-01 升级验证
 
 官方基础为 v0.65.0（db325fdf46ea7f7328feeb47a4f2005fe339909f）。本地 NAS 回归测试通过 479 项，新增持续事件最大等待时间、扫描负载保护与吞吐字段相关测试。双架构容器测试由发布工作流在固定版本及 latest 提升前执行。部署结果单独以 NAS 实际镜像版本和采集/上传健康检查确认。
+
+2026-10-03 部署确认：GitHub 发布工作流 37033217902 成功，固定标签及 latest 的 manifest digest 为 `sha256:e0664aee03fa5c21fc0157a274b5db99f637fee1a6e27ebe0755b081e89da4da`。DXP4800 与 DH4300Plus 实际运行版本均为 v0.65.0-01，容器健康且 collection/upload 均为 ok。4800 归档会话 3237 条、旧会话缺失 0；4300 升级前后均为 14 条；归档数据库完整性检查通过。
+
+状态及 Compose 备份存于各部署目录下 `backups/v0.63.1-01-before-0.65.0-01`（4300 完整关闭状态副本为 `state-closed`）。现有设备 ID、持久化挂载、300000ms 兜底周期、60000ms Watch 防抖与只读限制保持原样。新版 Watch 持续事件最大等待边界在该防抖配置下为 60 秒。启动后的内存快照不代表长期占用改善。
