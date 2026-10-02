@@ -38,3 +38,7 @@ the Hub is offline. No automatic device deletion is enabled.
   These are point-in-time observations, not a long-term performance benchmark.
 - The repository's `docker-compose.4300.yaml` is the volume4 deployment template;
   install it as `docker-compose.yaml` on the NAS to preserve UGREEN project management.
+
+## v0.65.0-01 升级验证
+
+官方基础为 v0.65.0（db325fdf46ea7f7328feeb47a4f2005fe339909f）。本地 NAS 回归测试通过 479 项，新增持续事件最大等待时间、扫描负载保护与吞吐字段相关测试。双架构容器测试由发布工作流在固定版本及 latest 提升前执行。部署结果单独以 NAS 实际镜像版本和采集/上传健康检查确认。

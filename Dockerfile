@@ -8,7 +8,7 @@ RUN npm pkg delete dependencies.electron-updater 'dependencies.@xhayper/discord-
 
 FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
 
-ARG BUILD_VERSION=v0.63.1-01
+ARG BUILD_VERSION=v0.65.0-01
 ARG VCS_REF=unknown
 ENV NODE_ENV=production TOKEN_MONITOR_NAS_VERSION=${BUILD_VERSION}
 WORKDIR /opt/token-monitor

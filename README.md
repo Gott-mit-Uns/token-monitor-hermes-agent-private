@@ -1,6 +1,6 @@
 # Token Monitor NAS
 
-基于 [Token Monitor 官方项目](https://github.com/Javis603/token-monitor) 的 NAS Docker Agent，采集 Hermes 用量并同步到自己配置的桌面 Hub。当前官方源码基线是 `v0.63.1`，NAS 发布版本是 `v0.63.1-01`。官方提交及源码范围见 [UPSTREAM.md](UPSTREAM.md)。
+基于 [Token Monitor 官方项目](https://github.com/Javis603/token-monitor) 的 NAS Docker Agent，采集 Hermes 用量并同步到自己配置的桌面 Hub。当前官方源码基线是 `v0.63.1`，NAS 发布版本是 `v0.65.0-01`。官方提交及源码范围见 [UPSTREAM.md](UPSTREAM.md)。
 
 Windows EXE Adapter 已迁移到独立公开仓库 [token-monitor-adapter](https://github.com/Gott-mit-Uns/token-monitor-adapter)，包括源码、Windows 构建工作流与历史 `adapter-v*` Release。本仓库只维护 NAS Docker Agent；Adapter 更新与下载请使用新仓库。
 
@@ -12,7 +12,7 @@ Windows EXE Adapter 已迁移到独立公开仓库 [token-monitor-adapter](https
 image: ghcr.io/gott-mit-uns/token-monitor-hermes:latest
 ```
 
-`latest` 指向最近一次通过双架构构建和测试的版本；也可以固定到 `ghcr.io/gott-mit-uns/token-monitor-hermes:v0.63.1-01`。支持 `linux/amd64` 与 `linux/arm64`。完整版本规则写在 [VERSIONING.md](VERSIONING.md)：官方版本作为前缀，每次引入新官方版本时 NAS 修订号从 `-01` 开始；同一官方版本上的 NAS 修改递增为 `-02`、`-03`。发布检查会校验版本号、Dockerfile 与官方 `app/package.json` 一致。固定镜像标签不覆盖，GitHub Release 与 Agent 上报使用相同版本。
+`latest` 指向最近一次通过双架构构建和测试的版本；也可以固定到 `ghcr.io/gott-mit-uns/token-monitor-hermes:v0.65.0-01`。支持 `linux/amd64` 与 `linux/arm64`。完整版本规则写在 [VERSIONING.md](VERSIONING.md)：官方版本作为前缀，每次引入新官方版本时 NAS 修订号从 `-01` 开始；同一官方版本上的 NAS 修改递增为 `-02`、`-03`。发布检查会校验版本号、Dockerfile 与官方 `app/package.json` 一致。固定镜像标签不覆盖，GitHub Release 与 Agent 上报使用相同版本。
 
 拉取并重新创建当前服务：
 
