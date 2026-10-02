@@ -192,7 +192,8 @@ function sessionsWithoutReasonix(sessions) {
 function buildSyncPayload(summary, {
   omitAllTimeProjects = false,
   omitHistoryTokenComponents = false,
-  omitModelThroughput = false
+  omitModelThroughput = false,
+  omitSessionDetails = false
 } = {}) {
   if (!summary || typeof summary !== 'object') return summary;
   const payload = { ...summary, limits: syncLimits(summary.limits) };
@@ -226,6 +227,11 @@ function buildSyncPayload(summary, {
       // local record for presentation, while the sync payload never carries text.
       payload[periodName].sessions = sessionsWithoutLocalTitles(payload[periodName].sessions);
       if (!projectsEnabled) payload[periodName].sessions = sessionsWithoutProjectMetadata(payload[periodName].sessions);
+      if (omitSessionDetails) {
+        setSessionOmission(payload, periodName, Object.keys(payload[periodName].sessions || {}).length);
+        payload[periodName].sessions = {};
+        if (projectsEnabled && period.projects) payload[periodName].projects = period.projects;
+      }
     }
   }
 
@@ -299,8 +305,8 @@ function syncPayload(summary, options = {}) {
   return serializeSyncPayload(summary, options).payload;
 }
 
-async function postSyncPayload(fetchFn, url, { headers = {}, summary, logger, signal } = {}) {
-  let serialized = serializeSyncPayload(summary);
+async function postSyncPayload(fetchFn, url, { headers = {}, summary, logger, signal, omitSessionDetails = false } = {}) {
+  let serialized = serializeSyncPayload(summary, { omitSessionDetails });
   if (serialized.payload?.allTimeProjectsOmitted === true && typeof logger === 'function') {
     logger(`all-time project breakdown omitted; payload reduced to ${serialized.bytes} bytes (budget ${SYNC_PAYLOAD_BUDGET_BYTES})`);
   }
@@ -319,6 +325,7 @@ async function postSyncPayload(fetchFn, url, { headers = {}, summary, logger, si
   let response = await fetchFn(url, { method: 'POST', headers, body: serialized.body, ...(signal ? { signal } : {}) });
   const retrySerialized = response.status === 413
     ? serializeSyncPayload(summary, {
+        omitSessionDetails,
         omitHistoryTokenComponents: true,
         omitAllTimeProjects: true,
         omitModelThroughput: true

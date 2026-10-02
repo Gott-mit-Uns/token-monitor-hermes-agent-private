@@ -26,6 +26,8 @@ services:
       TOKEN_MONITOR_LIMITS_ENABLED: "0"
       TOKEN_MONITOR_HISTORY_ENABLED: "1"
       TOKEN_MONITOR_SESSION_USAGE_ARCHIVE_ENABLED: "1"
+      # Preserve full local archive; upload aggregate usage without session rows.
+      TOKEN_MONITOR_SYNC_SESSION_DETAILS_ENABLED: "0"
       # Native events speed up updates; the 5-minute collector interval remains
       # as a fallback when no filesystem event arrives.
       TOKEN_MONITOR_WATCH: "1"

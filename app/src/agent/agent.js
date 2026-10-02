@@ -154,6 +154,7 @@ const delivery = createDeduplicatingDelivery({
       ...(secret ? { authorization: `Bearer ${secret}` } : {})
     },
     summary,
+    sessionDetailsEnabled: parseBoolean(process.env.TOKEN_MONITOR_SYNC_SESSION_DETAILS_ENABLED, true),
     timeoutMs: Number(process.env.TOKEN_MONITOR_UPLOAD_TIMEOUT_MS) || 30000,
     logger: (message) => console.warn(`[sync] ${message}`)
   }),
