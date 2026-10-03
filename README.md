@@ -1,6 +1,6 @@
 # Token Monitor NAS
 
-基于 [Token Monitor 官方项目](https://github.com/Javis603/token-monitor) 的 NAS Docker Agent，采集 Hermes 用量并同步到自己配置的桌面 Hub。当前官方源码基线是 `v0.65.0`，NAS 发布版本是 `v0.65.0-02`。官方提交及源码范围见 [UPSTREAM.md](UPSTREAM.md)。
+基于 [Token Monitor 官方项目](https://github.com/Javis603/token-monitor) 的 NAS Docker Agent，采集 Hermes 用量并同步到自己配置的桌面 Hub。当前官方源码基线是 `v0.65.0`，NAS 发布版本是 `v0.65.0-03`。官方提交及源码范围见 [UPSTREAM.md](UPSTREAM.md)。
 
 Windows EXE Adapter 已迁移到独立公开仓库 [token-monitor-adapter](https://github.com/Gott-mit-Uns/token-monitor-adapter)，包括源码、Windows 构建工作流与历史 `adapter-v*` Release。本仓库只维护 NAS Docker Agent；Adapter 更新与下载请使用新仓库。
 
@@ -12,7 +12,7 @@ Windows EXE Adapter 已迁移到独立公开仓库 [token-monitor-adapter](https
 image: ghcr.io/gott-mit-uns/token-monitor-hermes:latest
 ```
 
-`latest` 指向最近一次通过双架构构建和测试的版本；也可以固定到 `ghcr.io/gott-mit-uns/token-monitor-hermes:v0.65.0-02`。支持 `linux/amd64` 与 `linux/arm64`。完整版本规则写在 [VERSIONING.md](VERSIONING.md)：官方版本作为前缀，每次引入新官方版本时 NAS 修订号从 `-01` 开始；同一官方版本上的 NAS 修改递增为 `-02`、`-03`。发布检查会校验版本号、Dockerfile 与官方 `app/package.json` 一致。固定镜像标签不覆盖，GitHub Release 与 Agent 上报使用相同版本。
+`latest` 指向最近一次通过双架构构建和测试的版本；也可以固定到 `ghcr.io/gott-mit-uns/token-monitor-hermes:v0.65.0-03`。支持 `linux/amd64` 与 `linux/arm64`。完整版本规则写在 [VERSIONING.md](VERSIONING.md)：官方版本作为前缀，每次引入新官方版本时 NAS 修订号从 `-01` 开始；同一官方版本上的 NAS 修改递增为 `-02`、`-03`。发布检查会校验版本号、Dockerfile 与官方 `app/package.json` 一致。固定镜像标签不覆盖，GitHub Release 与 Agent 上报使用相同版本。
 
 拉取并重新创建当前服务：
 
@@ -51,4 +51,8 @@ GitHub Actions 只构建仓库源码和测试数据，不连接 NAS、不读取�
 
 ## 汇总同步模式
 
-`TOKEN_MONITOR_SYNC_SESSION_DETAILS_ENABLED` 默认开启（`1`）。DXP4800 模板设置为 `0`，上传副本清空今天、本月逐会话明细，并通过 `sessionDetailsOmitted` 上报省略数量；用量汇总、历史、模型统计及本地会话归档继续保留。DH4300Plus 模板保持默认行为。上传仍为完整快照，首次新快照会替换 Hub 的旧会话明细。更改后须重建容器；将变量设回 `1` 即可恢复明细同步。
+`TOKEN_MONITOR_SYNC_SESSION_DETAILS_ENABLED` 默认开启（`1`）。两个 NAS 模板均明确设置为 `1`，同步完整会话明细。仅当用户主动设置为 `0` 时，上传副本才会清空今天、本月逐会话明细，并通过 `sessionDetailsOmitted` 上报省略数量；用量汇总、历史、模型统计及本地会话归档继续保留。上传仍为完整快照，首次新快照会替换 Hub 的旧会话明细。更改后须重建容器；将变量设回 `1` 即可恢复明细同步。
+
+## 构建策略
+
+依赖安装层只依赖 npm 清单；Tokscale 验证层仅复制其入口、辅助模块及固定清单，修改其他脚本不会触发依赖重装。运行阶段通过 `COPY --link` 复制生产依赖。GitHub Actions 使用 GHA 层缓存；不额外引入需要跨临时 runner 持久化的 npm 缓存挂载。继续使用固定摘要的 Debian slim 基础以保持双架构原生依赖兼容。

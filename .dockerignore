@@ -5,5 +5,8 @@
 !app/src/
 !app/src/**
 !app/scripts/
-!app/scripts/**
+!app/scripts/ensure-vendored-tokscale.js
+!app/scripts/vendoredTokscale.js
+!app/scripts/vendor/
+!app/scripts/vendor/tokscale.json
 **/._*

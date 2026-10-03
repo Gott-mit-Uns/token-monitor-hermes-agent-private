@@ -3,7 +3,7 @@
 - 仓库：<https://github.com/Javis603/token-monitor>
 - 官方 tag：`v0.65.0`
 - 官方提交：`db325fdf46ea7f7328feeb47a4f2005fe339909f`
-- NAS 发布号：`v0.65.0-02`
+- NAS 发布号：`v0.65.0-03`
 - 源码范围：`app/src/shared`、官方 `app/src/agent/agent.js`、`runtime.js`、`seedClients.js`、相关构建脚本和依赖清单；NAS 专用代码在 Agent 包装、Docker、Compose 和发布检查中。
 
 迁移重点：官方新版将 `session-usage-archive.json` 迁至 `session-usage-archive.sqlite`，成功后会移除旧 JSON。部署前须备份整个状态目录；回退到旧镜像时也必须恢复迁移前的状态副本，不能只切换镜像标签。
@@ -12,4 +12,6 @@
 
 保留 NAS 的 `verify-vendored-tokscale.js` 验证脚本：官方新增 Muse/FX 与 fork 分组契约不属于本容器的 Hermes 采集范围，避免对 npm 二进制误用 fork 专用断言。
 
-NAS 修订 02：仅在构造上传副本时支持省略逐会话明细，保留汇总及本地归档；上传重试沿用该策略。DXP4800 模板启用汇总模式，其他部署默认兼容。没有归档迁移。
+NAS 修订 02：仅在构造上传副本时支持省略逐会话明细，保留汇总及本地归档；上传重试沿用该策略。当时的 DXP4800 模板启用汇总模式，其他部署默认兼容。没有归档迁移。
+
+NAS 修订 03：两个 Compose 模板显式开启会话明细同步，文档与实际部署一致；分离 npm 安装与 Tokscale 验证缓存，限制构建脚本复制范围，并使用命名运行阶段和 `COPY --link`。采集、上传、权限和归档格式不变。
